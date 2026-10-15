@@ -28,6 +28,7 @@
 #include <stdarg.h>
 #include "p9copy.h"
 #include "gl_vk_provision.h"
+#include "streaming.h"
 #include "../transport/asb_transport.h"
 
 #pragma comment(lib, "ws2_32.lib")
@@ -2571,6 +2572,9 @@ static void WINAPI service_main(DWORD argc, LPSTR *argv)
     /* Start audio capture monitor (SYSTEM, :0004) */
     start_audio_monitor();
 
+    /* Native display streaming (Sunshine), when provisioning turned it on */
+    streaming_start(agent_log);
+
     set_service_status(SERVICE_RUNNING, 0);
     agent_log("Service started.");
 
@@ -2585,6 +2589,8 @@ static void WINAPI service_main(DWORD argc, LPSTR *argv)
 
     /* Clean up */
     agent_log("Stop event signaled, cleaning up...");
+    agent_log("Stopping streaming...");
+    streaming_stop();
     agent_log("Stopping SSH proxy...");
     stop_ssh_proxy();
     agent_log("SSH proxy stopped.");
