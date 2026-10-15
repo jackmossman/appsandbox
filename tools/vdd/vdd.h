@@ -38,8 +38,16 @@ Environment:
 /* ============================================================================
  *  Display constants
  * ============================================================================ */
-#define VDD_WIDTH            1920
-#define VDD_HEIGHT           1080
+/* Overridable at build time (CL=/DVDD_WIDTH=... ) to build measurement variants. */
+#ifndef VDD_WIDTH
+#define VDD_WIDTH            5120
+#endif
+#ifndef VDD_HEIGHT
+#define VDD_HEIGHT           2160
+#endif
+#ifndef VDD_REFRESH
+#define VDD_REFRESH          120
+#endif
 #define VDD_BPP              4          /* BGRA 8-bit */
 #define VDD_STRIDE           (VDD_WIDTH * VDD_BPP)
 #define VDD_PIXEL_BYTES      (VDD_STRIDE * VDD_HEIGHT)
@@ -208,6 +216,23 @@ typedef struct _VDD_SWAP_PROC {
     PBYTE               pCursorShapeBuffer; /* buffer for cursor bitmap */
     UINT                cursorBufSize;      /* size of pCursorShapeBuffer (2x for MASKED_COLOR) */
     DWORD               lastShapeId;        /* last received shape ID */
+
+    /* Decoupled sending. The swap chain thread copies each frame into pendBuf and hands the
+       surface back to IddCx at once; the send thread sends the newest pending frame.
+       connLock serializes every write to (and close of) hClientConn: frames, cursor updates. */
+    SRWLOCK             connLock;
+    SRWLOCK             pendLock;           /* guards pend* and the pendBuf/sendBuf swap */
+    HANDLE              hSendEvent;         /* auto-reset: a frame is pending */
+    HANDLE              hSendThread;
+    volatile BOOL       bStopSend;
+    volatile LONG       cursorPending;      /* set by the swap chain thread, sent by the send thread */
+    PBYTE               pendBuf;            /* VDD_PIXEL_BYTES, tight rows */
+    PBYTE               sendBuf;            /* VDD_PIXEL_BYTES, owned by the send thread */
+    PBYTE               packBuf;            /* VDD_PIXEL_BYTES, dirty rects packed for one write */
+    RECT                pendRects[VDD_MAX_DIRTY_RECTS];
+    UINT                pendRectCount;
+    BOOL                pendFull;
+    BOOL                pendValid;
 } VDD_SWAP_PROC;
 
 /* ============================================================================

@@ -115,12 +115,12 @@ static void VddCreateMonitorMode(DISPLAYCONFIG_VIDEO_SIGNAL_INFO* sig, UINT vSyn
     sig->activeSize.cy                          = VDD_HEIGHT;
     sig->AdditionalSignalInfo.vSyncFreqDivider  = vSyncDivider;
     sig->AdditionalSignalInfo.videoStandard     = 255;
-    sig->vSyncFreq.Numerator                    = 60;
+    sig->vSyncFreq.Numerator                    = VDD_REFRESH;
     sig->vSyncFreq.Denominator                  = 1;
-    sig->hSyncFreq.Numerator                    = 60 * VDD_HEIGHT;
+    sig->hSyncFreq.Numerator                    = VDD_REFRESH * VDD_HEIGHT;
     sig->hSyncFreq.Denominator                  = 1;
     sig->scanLineOrdering                       = DISPLAYCONFIG_SCANLINE_ORDERING_PROGRESSIVE;
-    sig->pixelRate                               = (UINT64)60 * VDD_WIDTH * VDD_HEIGHT;
+    sig->pixelRate                               = (UINT64)VDD_REFRESH * VDD_WIDTH * VDD_HEIGHT;
 }
 
 /* ========================================================================= */
@@ -388,7 +388,7 @@ static DWORD WINAPI VddSwapChainThread(LPVOID lpParameter)
 }
 
 /* Query hardware cursor and send update to host if connected */
-static void VddSendCursorUpdate(VDD_SWAP_PROC* proc)
+static void VddSendCursorUpdateLocked(VDD_SWAP_PROC* proc)
 {
     IDARG_IN_QUERY_HWCURSOR inArgs = {};
     IDARG_OUT_QUERY_HWCURSOR3 outArgs = {};
@@ -457,6 +457,141 @@ static void VddSendCursorUpdate(VDD_SWAP_PROC* proc)
     }
 }
 
+static void VddSendCursorUpdate(VDD_SWAP_PROC* proc)
+{
+    InterlockedExchange(&proc->cursorPending, 1);
+    SetEvent(proc->hSendEvent);
+}
+
+/* ========================================================================= */
+/*  Decoupled frame sending                                                  */
+/*                                                                           */
+/*  Sending used to happen before FinishedProcessingFrame, so a send longer   */
+/*  than one refresh interval made every frame miss the next vsync and       */
+/*  halved the frame rate. Now the swap chain thread only copies the frame   */
+/*  into pendBuf; VddSendThread sends the newest pending frame in one write. */
+/* ========================================================================= */
+
+/* Queue a frame from the mapped staging texture. A frame still pending when the next one
+   arrives is replaced; its dirty rects are lost, so the replacement is sent whole. */
+static void VddQueueFrame(VDD_SWAP_PROC* proc, const D3D11_MAPPED_SUBRESOURCE* m,
+                          BOOL full, const RECT* rects, UINT rectCount)
+{
+    AcquireSRWLockExclusive(&proc->pendLock);
+    if (proc->pendValid) full = TRUE;
+    if (full) {
+        for (UINT row = 0; row < VDD_HEIGHT; row++)
+            memcpy(proc->pendBuf + (SIZE_T)row * VDD_STRIDE,
+                   (const BYTE*)m->pData + (SIZE_T)row * m->RowPitch, VDD_STRIDE);
+        proc->pendRectCount = 0;
+    } else {
+        for (UINT i = 0; i < rectCount; i++) {
+            SIZE_T rowBytes = (SIZE_T)(rects[i].right - rects[i].left) * VDD_BPP;
+            for (LONG y = rects[i].top; y < rects[i].bottom; y++)
+                memcpy(proc->pendBuf + (SIZE_T)y * VDD_STRIDE + (SIZE_T)rects[i].left * VDD_BPP,
+                       (const BYTE*)m->pData + (SIZE_T)y * m->RowPitch + (SIZE_T)rects[i].left * VDD_BPP,
+                       rowBytes);
+        }
+        memcpy(proc->pendRects, rects, rectCount * sizeof(RECT));
+        proc->pendRectCount = rectCount;
+    }
+    proc->pendFull  = full;
+    proc->pendValid = TRUE;
+    ReleaseSRWLockExclusive(&proc->pendLock);
+    SetEvent(proc->hSendEvent);
+}
+
+static DWORD WINAPI VddSendThread(LPVOID lpParameter)
+{
+    VDD_SWAP_PROC* proc = (VDD_SWAP_PROC*)lpParameter;
+    RECT rects[VDD_MAX_DIRTY_RECTS];
+    LARGE_INTEGER freq, t0, t1;
+    ULONGLONG statStart = GetTickCount64(), statBytes = 0;
+    UINT statFrames = 0, statFull = 0;
+    double statSendMs = 0.0;
+    QueryPerformanceFrequency(&freq);
+
+    while (WaitForSingleObject(proc->hSendEvent, INFINITE) == WAIT_OBJECT_0 && !proc->bStopSend) {
+        BOOL full;
+        UINT rectCount;
+        PBYTE buf;
+
+        if (InterlockedExchange(&proc->cursorPending, 0)) {
+            AcquireSRWLockExclusive(&proc->connLock);
+            VddSendCursorUpdateLocked(proc);
+            ReleaseSRWLockExclusive(&proc->connLock);
+        }
+
+        AcquireSRWLockExclusive(&proc->pendLock);
+        if (!proc->pendValid) { ReleaseSRWLockExclusive(&proc->pendLock); continue; }
+        buf = proc->pendBuf; proc->pendBuf = proc->sendBuf; proc->sendBuf = buf;
+        full      = proc->pendFull;
+        rectCount = proc->pendRectCount;
+        memcpy(rects, proc->pendRects, rectCount * sizeof(RECT));
+        proc->pendValid = FALSE;
+        ReleaseSRWLockExclusive(&proc->pendLock);
+
+        /* Full frames are already tight in buf; dirty rects are packed row by row. */
+        const BYTE* data = buf;
+        UINT32 dataSize  = VDD_PIXEL_BYTES;
+        if (!full) {
+            PBYTE dst = proc->packBuf;
+            for (UINT i = 0; i < rectCount; i++) {
+                SIZE_T rowBytes = (SIZE_T)(rects[i].right - rects[i].left) * VDD_BPP;
+                for (LONG y = rects[i].top; y < rects[i].bottom; y++) {
+                    memcpy(dst, buf + (SIZE_T)y * VDD_STRIDE + (SIZE_T)rects[i].left * VDD_BPP, rowBytes);
+                    dst += rowBytes;
+                }
+            }
+            data     = proc->packBuf;
+            dataSize = (UINT32)(dst - proc->packBuf);
+            if (dataSize == 0) continue;
+        }
+
+        QueryPerformanceCounter(&t0);
+        AcquireSRWLockExclusive(&proc->connLock);
+        AsbConn* s = proc->hClientConn;
+        if (s) {
+            VDD_WIRE_FRAME_HEADER whdr;
+            whdr.magic            = VDD_FRAME_MAGIC;
+            whdr.width            = VDD_WIDTH;
+            whdr.height           = VDD_HEIGHT;
+            whdr.stride           = VDD_STRIDE;
+            whdr.frame_seq        = ++proc->frameSeq;
+            whdr.dirty_rect_count = full ? 0 : rectCount;
+            BOOL ok = VddSendAll(s, (const char*)&whdr, sizeof(whdr)) == 0 &&
+                      (full || VddSendAll(s, (const char*)rects, (int)(rectCount * sizeof(RECT))) == 0) &&
+                      VddSendAll(s, (const char*)&dataSize, sizeof(dataSize)) == 0 &&
+                      VddSendAll(s, (const char*)data, (int)dataSize) == 0;
+            if (!ok) {
+                VddLog("Frame: send failed, disconnecting (seq=%llu)", proc->frameSeq);
+                VddCloseConn(&proc->hClientConn);
+            } else {
+                statFrames++;
+                statBytes += dataSize;
+                if (full) statFull++;
+                if (proc->frameSeq == 1)
+                    VddLog("Frame: first frame sent (%ux%u, %u bytes)", VDD_WIDTH, VDD_HEIGHT, dataSize);
+            }
+        }
+        ReleaseSRWLockExclusive(&proc->connLock);
+        QueryPerformanceCounter(&t1);
+        statSendMs += (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / freq.QuadPart;
+
+        ULONGLONG now = GetTickCount64();
+        if (now - statStart >= 1000) {
+            double secs = (double)(now - statStart) / 1000.0;
+            if (statFrames)
+                VddLog("Send: %ux%u fps=%.1f full=%u MB/s=%.1f send_ms/frame=%.2f busy=%.0f%%",
+                       VDD_WIDTH, VDD_HEIGHT, statFrames / secs, statFull,
+                       (double)statBytes / (1024.0 * 1024.0) / secs,
+                       statSendMs / statFrames, statSendMs / (secs * 10.0));
+            statStart = now; statFrames = 0; statFull = 0; statBytes = 0; statSendMs = 0.0;
+        }
+    }
+    return 0;
+}
+
 static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
 {
     IDXGIDevice* pDxgiDevice = NULL;
@@ -505,6 +640,13 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
     BOOL bHasFrame = FALSE;
     BOOL bSentFullFrame = FALSE;   /* TRUE after first full frame sent to current client */
     UINT cachedRowPitch = VDD_STRIDE;
+    /* Capture measurement: frames handed back to IddCx per second, and the time spent
+       copying each into pendBuf. Sending is measured by VddSendThread. */
+    ULONGLONG statStart = GetTickCount64();
+    UINT statFrames = 0;
+    double statCopyMs = 0.0;
+    LARGE_INTEGER statFreq, statT0, statT1;
+    QueryPerformanceFrequency(&statFreq);
 
 
     /* Main frame acquisition loop */
@@ -521,15 +663,27 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
                    the pending connection is the SAME single slot the host just re-armed, so closing
                    the old wrapper would mark the shared slot CLOSING and kill the new one — abandon
                    the stale wrapper instead. */
+                AcquireSRWLockExclusive(&proc->connLock);
                 if (proc->hClientConn) {
                     if (asb_conn_socket_u64(proc->hClientConn) != ~0ull)
                         VddCloseConn(&proc->hClientConn);          /* PC: real close */
                     else { asb_abandon(proc->hClientConn); proc->hClientConn = NULL; }  /* ivshmem */
                     VddLog("Frame: replaced previous client connection");
                 }
+                ReleaseSRWLockExclusive(&proc->connLock);
                 asb_stream_reset(pending);   /* ivshmem: align the fresh full frame at ring offset 0 (no-op on PC) */
+                {
+                    unsigned long long ps = asb_conn_socket_u64(pending);
+                    if (ps != ~0ull) {
+                        int sz = 64 * 1024 * 1024;
+                        int rc = setsockopt((SOCKET)ps, SOL_SOCKET, SO_SNDBUF, (const char*)&sz, sizeof(sz));
+                        VddLog("Frame: SO_SNDBUF=%d rc=%d err=%d", sz, rc, rc ? WSAGetLastError() : 0);
+                    }
+                }
+                AcquireSRWLockExclusive(&proc->connLock);
                 proc->hClientConn = pending;
                 proc->frameSeq = 0;
+                ReleaseSRWLockExclusive(&proc->connLock);
                 bSentFullFrame = FALSE;   /* new connection -> first frame is full (the reconnect trigger) */
                 VddLog("Frame: new client connection active");
             }
@@ -574,40 +728,8 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
                 hr = proc->pDeviceContext->Map(proc->pStagingTex, 0, D3D11_MAP_READ, 0, &mapped);
                 if (SUCCEEDED(hr))
                 {
-                    VDD_WIRE_FRAME_HEADER whdr;
-                    UINT32 data_size = VDD_STRIDE * VDD_HEIGHT;
-                    BOOL send_ok = TRUE;
-                    AsbConn* s = proc->hClientConn;
-
-                    proc->frameSeq++;
-                    whdr.magic            = VDD_FRAME_MAGIC;
-                    whdr.width            = VDD_WIDTH;
-                    whdr.height           = VDD_HEIGHT;
-                    whdr.stride           = VDD_STRIDE;
-                    whdr.frame_seq        = proc->frameSeq;
-                    whdr.dirty_rect_count = 0;
-
-                    if (VddSendAll(s, (const char*)&whdr, sizeof(whdr)) != 0 ||
-                        VddSendAll(s, (const char*)&data_size, sizeof(data_size)) != 0) {
-                        send_ok = FALSE;
-                    }
-                    if (send_ok) {
-                        for (UINT row = 0; row < VDD_HEIGHT; row++) {
-                            if (VddSendAll(s, (const char*)((const BYTE*)mapped.pData + row * mapped.RowPitch),
-                                           VDD_STRIDE) != 0) {
-                                send_ok = FALSE;
-                                break;
-                            }
-                        }
-                    }
-
+                    VddQueueFrame(proc, &mapped, TRUE, NULL, 0);
                     proc->pDeviceContext->Unmap(proc->pStagingTex, 0);
-
-                    if (!send_ok) {
-                        VddLog("Frame: resend failed, disconnecting (seq=%llu)", proc->frameSeq);
-                        VddCloseConn(&proc->hClientConn);
-                        bSentFullFrame = FALSE;
-                    }
                 }
             }
 
@@ -624,6 +746,7 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
                 hr = pSurface->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&pTexture);
                 if (SUCCEEDED(hr) && pTexture)
                 {
+                    QueryPerformanceCounter(&statT0);
                     proc->pDeviceContext->CopyResource(proc->pStagingTex, pTexture);
 
                     D3D11_MAPPED_SUBRESOURCE mapped = {};
@@ -658,95 +781,35 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
                                 }
                             }
 
-                            VDD_WIRE_FRAME_HEADER whdr;
-                            BOOL send_ok = TRUE;
-                            AsbConn* s = proc->hClientConn;
-
-                            proc->frameSeq++;
-                            whdr.magic            = VDD_FRAME_MAGIC;
-                            whdr.width            = VDD_WIDTH;
-                            whdr.height           = VDD_HEIGHT;
-                            whdr.stride           = VDD_STRIDE;
-                            whdr.frame_seq        = proc->frameSeq;
-
-                            if (sendFull) {
-                                /* Full frame */
-                                UINT32 data_size = VDD_STRIDE * VDD_HEIGHT;
-                                whdr.dirty_rect_count = 0;
-
-                                if (VddSendAll(s, (const char*)&whdr, sizeof(whdr)) != 0 ||
-                                    VddSendAll(s, (const char*)&data_size, sizeof(data_size)) != 0)
-                                    send_ok = FALSE;
-
-                                if (send_ok) {
-                                    for (UINT row = 0; row < VDD_HEIGHT; row++) {
-                                        if (VddSendAll(s, (const char*)((const BYTE*)mapped.pData + row * mapped.RowPitch),
-                                                       VDD_STRIDE) != 0) {
-                                            send_ok = FALSE;
-                                            break;
-                                        }
-                                    }
+                            /* Clamp rects to the frame; queue whole if none survive. */
+                            if (!sendFull) {
+                                UINT kept = 0;
+                                for (UINT32 i = 0; i < rectCount; i++) {
+                                    RECT r = dirtyRects[i];
+                                    if (r.left < 0) r.left = 0;
+                                    if (r.top  < 0) r.top  = 0;
+                                    if (r.right  > (LONG)VDD_WIDTH)  r.right  = VDD_WIDTH;
+                                    if (r.bottom > (LONG)VDD_HEIGHT) r.bottom = VDD_HEIGHT;
+                                    if (r.left < r.right && r.top < r.bottom) dirtyRects[kept++] = r;
                                 }
-                                if (send_ok) bSentFullFrame = TRUE;
-                            } else {
-                                /* Dirty rects only */
-                                UINT32 data_size = 0;
-                                UINT32 i;
-
-                                /* Clamp rects to frame bounds and calculate total data size */
-                                for (i = 0; i < rectCount; i++) {
-                                    if (dirtyRects[i].left < 0) dirtyRects[i].left = 0;
-                                    if (dirtyRects[i].top  < 0) dirtyRects[i].top  = 0;
-                                    if (dirtyRects[i].right  > (LONG)VDD_WIDTH)  dirtyRects[i].right  = VDD_WIDTH;
-                                    if (dirtyRects[i].bottom > (LONG)VDD_HEIGHT) dirtyRects[i].bottom = VDD_HEIGHT;
-                                    if (dirtyRects[i].left < dirtyRects[i].right &&
-                                        dirtyRects[i].top < dirtyRects[i].bottom) {
-                                        UINT rw = (UINT)(dirtyRects[i].right - dirtyRects[i].left);
-                                        UINT rh = (UINT)(dirtyRects[i].bottom - dirtyRects[i].top);
-                                        data_size += rw * 4 * rh;
-                                    }
-                                }
-
-                                /* All rects zero area after clamping — skip send */
-                                if (data_size == 0) goto skip_send;
-
-                                whdr.dirty_rect_count = rectCount;
-
-                                if (VddSendAll(s, (const char*)&whdr, sizeof(whdr)) != 0 ||
-                                    VddSendAll(s, (const char*)dirtyRects, rectCount * sizeof(RECT)) != 0 ||
-                                    VddSendAll(s, (const char*)&data_size, sizeof(data_size)) != 0)
-                                    send_ok = FALSE;
-
-                                /* Send per-rect pixel rows */
-                                if (send_ok) {
-                                    for (i = 0; i < rectCount && send_ok; i++) {
-                                        LONG left = dirtyRects[i].left;
-                                        LONG top  = dirtyRects[i].top;
-                                        UINT rw   = (UINT)(dirtyRects[i].right - left);
-                                        UINT rh   = (UINT)(dirtyRects[i].bottom - top);
-                                        if (rw == 0 || rh == 0) continue;
-                                        for (UINT row = 0; row < rh; row++) {
-                                            const BYTE *src = (const BYTE*)mapped.pData
-                                                              + ((UINT)top + row) * mapped.RowPitch
-                                                              + (UINT)left * 4;
-                                            if (VddSendAll(s, (const char*)src, rw * 4) != 0) {
-                                                send_ok = FALSE;
-                                                break;
-                                            }
-                                        }
-                                    }
+                                rectCount = kept;
+                            }
+                            if (sendFull || rectCount > 0) {
+                                VddQueueFrame(proc, &mapped, sendFull, dirtyRects, rectCount);
+                                if (sendFull) bSentFullFrame = TRUE;
+                            }
+                            QueryPerformanceCounter(&statT1);
+                            statCopyMs += (double)(statT1.QuadPart - statT0.QuadPart) * 1000.0 / statFreq.QuadPart;
+                            statFrames++;
+                            {
+                                ULONGLONG now = GetTickCount64();
+                                if (now - statStart >= 1000) {
+                                    double secs = (double)(now - statStart) / 1000.0;
+                                    VddLog("Capture: %ux%u fps=%.1f copy_ms/frame=%.2f",
+                                           VDD_WIDTH, VDD_HEIGHT, statFrames / secs, statCopyMs / statFrames);
+                                    statStart = now; statFrames = 0; statCopyMs = 0.0;
                                 }
                             }
-
-                            if (!send_ok) {
-                                VddLog("Frame: send failed, disconnecting (seq=%llu)", proc->frameSeq);
-                                VddCloseConn(&proc->hClientConn);
-                                bSentFullFrame = FALSE;
-                            } else if (proc->frameSeq == 1) {
-                                VddLog("Frame: first frame sent (%ux%u, %u bytes)",
-                                       VDD_WIDTH, VDD_HEIGHT, VDD_STRIDE * VDD_HEIGHT);
-                            }
-                        skip_send:;
                         }
 
                         proc->pDeviceContext->Unmap(proc->pStagingTex, 0);
@@ -824,6 +887,23 @@ static void VddDestroySwapProc(VDD_SWAP_PROC* proc)
         CloseHandle(proc->hNetworkThread);
     }
 
+    /* Stop the send thread. Shut the socket down first so a send blocked on a host that
+       stopped reading returns. */
+    if (proc->hSendThread)
+    {
+        proc->bStopSend = TRUE;
+        if (proc->hClientConn) {
+            unsigned long long s = asb_conn_socket_u64(proc->hClientConn);
+            if (s != ~0ull) shutdown((SOCKET)s, SD_BOTH);
+        }
+        SetEvent(proc->hSendEvent);
+        VddLog("DestroySwapProc: waiting for send thread...");
+        WaitForSingleObject(proc->hSendThread, 5000);
+        CloseHandle(proc->hSendThread);
+    }
+    if (proc->hSendEvent)
+        CloseHandle(proc->hSendEvent);
+
     /* Close any remaining client connection */
     VddLog("DestroySwapProc: closing client connection (%p)", (void*)proc->hClientConn);
     VddCloseConn(&proc->hClientConn);
@@ -855,6 +935,9 @@ static void VddDestroySwapProc(VDD_SWAP_PROC* proc)
         proc->pStagingTex->Release();
     VddLog("DestroySwapProc: staging texture released");
 
+    free(proc->pendBuf);
+    free(proc->sendBuf);
+    free(proc->packBuf);
     free(proc);
     VddLog("DestroySwapProc: COMPLETE");
 }
@@ -1156,6 +1239,28 @@ NTSTATUS VddMonitorAssignSwapChain(
     }
     VddLog("AssignSwapChain: staging texture created");
 
+    /* Decoupled sending: buffers, locks, and the send thread. */
+    InitializeSRWLock(&proc->connLock);
+    InitializeSRWLock(&proc->pendLock);
+    proc->pendBuf    = (PBYTE)malloc(VDD_PIXEL_BYTES);
+    proc->sendBuf    = (PBYTE)malloc(VDD_PIXEL_BYTES);
+    proc->packBuf    = (PBYTE)malloc(VDD_PIXEL_BYTES);
+    proc->hSendEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
+    if (proc->pendBuf && proc->sendBuf && proc->packBuf && proc->hSendEvent)
+        proc->hSendThread = CreateThread(NULL, 0, VddSendThread, proc, 0, NULL);
+    if (!proc->hSendThread)
+    {
+        VddLog("AssignSwapChain: send thread setup FAILED err=%u", GetLastError());
+        free(proc->pendBuf); free(proc->sendBuf); free(proc->packBuf);
+        if (proc->hSendEvent) CloseHandle(proc->hSendEvent);
+        proc->pStagingTex->Release();
+        if (proc->hTerminateEvent)
+            CloseHandle(proc->hTerminateEvent);
+        free(proc);
+        return (NTSTATUS)0xC01E0012L; /* STATUS_GRAPHICS_INDIRECT_DISPLAY_ABANDON_SWAPCHAIN */
+    }
+    VddLog("AssignSwapChain: send thread created (%u bytes x3)", (UINT)VDD_PIXEL_BYTES);
+
     /* Setup hardware cursor BEFORE starting swap chain thread — the thread
        reads proc->hCursorEvent at startup to build its wait handle array */
     VddLog("AssignSwapChain: setting up hardware cursor...");
@@ -1280,7 +1385,7 @@ NTSTATUS VddParseMonitorDescription(
     VddCreateMonitorMode(&pMode->MonitorVideoSignalInfo, 0); /* vSyncDivider=0 for monitor modes */
 
     pOutArgs->PreferredMonitorModeIdx = 0;
-    VddLog("ParseMonitorDescription: returning 1 mode (1920x1080@60)");
+    VddLog("ParseMonitorDescription: returning 1 mode (%ux%u@%u)", VDD_WIDTH, VDD_HEIGHT, VDD_REFRESH);
     return STATUS_SUCCESS;
 }
 

@@ -42,8 +42,8 @@ static const GUID INPUT_SERVICE_GUID =
 /* ---- Frame protocol ---- */
 
 #define FRAME_MAGIC         0x52465341  /* "ASFR" */
-#define DEFAULT_WIDTH       1920
-#define DEFAULT_HEIGHT      1080
+#define DEFAULT_WIDTH       5120
+#define DEFAULT_HEIGHT      2160
 #define MAX_DIRTY_RECTS     64
 #define MAX_FRAME_DATA_SIZE (DEFAULT_WIDTH * DEFAULT_HEIGHT * 4)
 
