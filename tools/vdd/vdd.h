@@ -6,11 +6,12 @@ Module Name:
 
 Abstract:
 
-    AppSandbox Virtual Display Driver - Single 1920x1080 monitor with
-    direct HvSocket frame transport to the host (no agent middleman).
+    AppSandbox Virtual Display Driver - single monitor with direct HvSocket
+    frame transport to the host (no agent middleman).
 
-    Single fixed-resolution monitor with framebuffer readback sent directly
-    over Hyper-V sockets.
+    One mode, read from the registry when the device starts (stock
+    1920x1080@60 when unset), with framebuffer readback sent directly over
+    Hyper-V sockets.
 
 Environment:
 
@@ -33,25 +34,41 @@ Environment:
 #include <avrt.h>
 
 #include "Trace.h"
+#include "vdd_edid.h"
 #include "../transport/asb_transport.h"   /* AsbConn — host connection (AF_HYPERV on PC, ivshmem on Mac) */
 
 /* ============================================================================
- *  Display constants
+ *  Display mode
+ *
+ *  Read once per device start from HKLM\SOFTWARE\AppSandbox\VDD, DWORD values:
+ *    Width, Height, RefreshRate   the single mode offered (all three, or none)
+ *    WidthMm, HeightMm            optional physical size for the EDID (DPI scaling)
+ *  Unset or out of range -> stock 1920x1080@60. The value has to exist before the
+ *  device is first installed, so it lives in a fixed key rather than the device's
+ *  own registry key. Restart the device to apply a change.
  * ============================================================================ */
-/* Overridable at build time (CL=/DVDD_WIDTH=... ) to build measurement variants. */
-#ifndef VDD_WIDTH
-#define VDD_WIDTH            5120
-#endif
-#ifndef VDD_HEIGHT
-#define VDD_HEIGHT           2160
-#endif
-#ifndef VDD_REFRESH
-#define VDD_REFRESH          120
-#endif
+#define VDD_REG_KEY          L"SOFTWARE\\AppSandbox\\VDD"
+#define VDD_DEFAULT_WIDTH    1920
+#define VDD_DEFAULT_HEIGHT   1080
+#define VDD_DEFAULT_REFRESH  60
+#define VDD_MIN_WIDTH        640
+#define VDD_MIN_HEIGHT       480
+#define VDD_MAX_DIMENSION    8192
+#define VDD_MAX_PIXELS       (5120 * 2160)  /* host viewer's frame buffer (vm_display_idd.c MAX_FRAME_DATA_SIZE) */
+#define VDD_MIN_REFRESH      30
+#define VDD_MAX_REFRESH      240
 #define VDD_BPP              4          /* BGRA 8-bit */
-#define VDD_STRIDE           (VDD_WIDTH * VDD_BPP)
-#define VDD_PIXEL_BYTES      (VDD_STRIDE * VDD_HEIGHT)
 #define VDD_MAX_DIRTY_RECTS  64
+
+typedef struct _VDD_MODE {
+    UINT    width;
+    UINT    height;
+    UINT    refresh;
+    UINT    stride;             /* width * VDD_BPP, tight rows on the wire */
+    SIZE_T  pixelBytes;         /* stride * height */
+    UINT    widthMm;            /* EDID physical size; 0 = derived from the mode */
+    UINT    heightMm;
+} VDD_MODE;
 
 /* ============================================================================
  *  Wire protocol: ASFR frame header (sent over HvSocket to host)
@@ -89,100 +106,6 @@ typedef struct _VDD_WIRE_CURSOR_HEADER {
     UINT32  shape_data_size;    /* bytes of shape data following header (0 if !shape_updated) */
 } VDD_WIRE_CURSOR_HEADER;
 #pragma pack(pop)
-
-/* ============================================================================
- *  Supported resolutions and refresh rates (single mode for this driver)
- * ============================================================================ */
-struct ResolutionEntry {
-    UINT width;
-    UINT height;
-};
-
-static const ResolutionEntry g_SupportedResolutions[] = {
-    { 1920, 1080 },
-};
-
-static const UINT g_NumResolutions = ARRAYSIZE(g_SupportedResolutions);
-
-struct RefreshRateEntry {
-    UINT numerator;
-    UINT denominator;
-};
-
-static const RefreshRateEntry g_SupportedRefreshRates[] = {
-    { 60, 1 },
-};
-
-static const UINT g_NumRefreshRates = ARRAYSIZE(g_SupportedRefreshRates);
-
-/* ============================================================================
- *  EDID - 128-byte block
- *
- *  Manufacturer: "ASB" (AppSandBox)
- *  Descriptor:   1920x1080 @ 60 Hz, 8-bit
- *  Checksum byte 127 is a placeholder - patched at runtime.
- * ============================================================================ */
-static const BYTE VDD_EDID[] = {
-    /* Header (bytes 0-7) */
-    0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00,
-
-    /* Manufacturer "ASB" = 0x06 0x62  (5-bit packed: A=1,S=19,B=2) */
-    /* Product code 0x0001, serial 0x00000001 */
-    0x06, 0x62, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00,
-
-    /* Week 1, year 2024 (offset from 1990 = 34 = 0x22) */
-    0x01, 0x22,
-
-    /* EDID version 1.4 */
-    0x01, 0x04,
-
-    /* Digital input, 8-bit color depth, DisplayPort */
-    0xA5,
-
-    /* 53cm x 30cm (approx 24" diagonal for 1920x1080) */
-    0x35, 0x1E,
-
-    /* Gamma 2.2 (value = (gamma*100)-100 = 120 = 0x78) */
-    0x78,
-
-    /* Supported features: RGB color, preferred timing in DTD1 */
-    0x22,
-
-    /* Chromaticity coordinates (standard sRGB-ish values) */
-    0xFC, 0x81, 0xA4, 0x55, 0x4D, 0x9D, 0x25, 0x12, 0x50, 0x54,
-
-    /* Established timings */
-    0x00, 0x00, 0x00,
-
-    /* Standard timings (unused, filled with 0x01 0x01) */
-    0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
-    0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
-
-    /* Detailed Timing Descriptor #1: 1920x1080 @ 60Hz */
-    0x02, 0x3A, 0x80, 0x18, 0x71, 0x38, 0x2D, 0x40,
-    0x58, 0x2C, 0x45, 0x00, 0x12, 0x2C, 0x21, 0x00,
-    0x00, 0x1E,
-
-    /* Descriptor #2: Monitor name "AppSandboxVDD" */
-    0x00, 0x00, 0x00, 0xFC, 0x00,
-    'A', 'p', 'p', 'S', 'a', 'n', 'd', 'b', 'o', 'x', 'V', 'D', 'D',
-
-    /* Descriptor #3: Monitor range limits */
-    0x00, 0x00, 0x00, 0xFD, 0x00,
-    0x38, 0x4C, 0x1E, 0x51, 0x11, 0x00, 0x0A,
-    0x20, 0x20, 0x20, 0x20, 0x20, 0x20,
-
-    /* Descriptor #4: Dummy (zero) */
-    0x00, 0x00, 0x00, 0x10, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00,
-
-    /* Extension block count */
-    0x00,
-
-    /* Checksum placeholder - computed at runtime */
-    0x00
-};
 
 /* ============================================================================
  *  Swap chain processor state (heap-allocated per AssignSwapChain)
@@ -226,9 +149,9 @@ typedef struct _VDD_SWAP_PROC {
     HANDLE              hSendThread;
     volatile BOOL       bStopSend;
     volatile LONG       cursorPending;      /* set by the swap chain thread, sent by the send thread */
-    PBYTE               pendBuf;            /* VDD_PIXEL_BYTES, tight rows */
-    PBYTE               sendBuf;            /* VDD_PIXEL_BYTES, owned by the send thread */
-    PBYTE               packBuf;            /* VDD_PIXEL_BYTES, dirty rects packed for one write */
+    PBYTE               pendBuf;            /* g_mode.pixelBytes, tight rows */
+    PBYTE               sendBuf;            /* g_mode.pixelBytes, owned by the send thread */
+    PBYTE               packBuf;            /* g_mode.pixelBytes, dirty rects packed for one write */
     RECT                pendRects[VDD_MAX_DIRTY_RECTS];
     UINT                pendRectCount;
     BOOL                pendFull;
@@ -250,10 +173,6 @@ typedef struct _VDD_DEVICE_CONTEXT {
     ID3D11Device*       pCachedDevice;
     ID3D11DeviceContext* pCachedCtx;
     LUID                cachedDeviceLuid;
-
-    /* Monitor mode list */
-    DISPLAYCONFIG_VIDEO_SIGNAL_INFO modes[2]; /* 1920x1080@60 (monitor + target) */
-    UINT                modeCount;
 
     /* Recovery: if no AssignSwapChain arrives within 5s of Unassign,
        depart and re-arrive the monitor to force DWM re-engagement.

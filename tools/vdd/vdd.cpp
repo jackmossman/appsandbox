@@ -6,8 +6,9 @@ Module Name:
 
 Abstract:
 
-    AppSandbox Virtual Display Driver - Single 1920x1080 monitor with
-    direct HvSocket frame transport to the host (no agent middleman).
+    AppSandbox Virtual Display Driver - single monitor, mode read from the
+    registry at device start, with direct HvSocket frame transport to the
+    host (no agent middleman).
 
     IddCx lifecycle:
     - DllMain
@@ -35,6 +36,13 @@ Environment:
 #include <d3dkmthk.h>  /* D3DKMTSetProcessSchedulingPriorityClass */
 #include <setupapi.h>  /* SetupDiGetClassDevs, SetupDiEnumDeviceInfo */
 #include "../transport/asb_transport.h"  /* ivshmem frame channel (Windows-VMs-on-Mac path only) */
+
+/* Build version from Directory.Build.props, passed unquoted by AppSandboxVDD.vcxproj. */
+#ifndef VDD_VERSION
+#define VDD_VERSION dev
+#endif
+#define VDD_STRINGIZE2(x) #x
+#define VDD_STRINGIZE(x)  VDD_STRINGIZE2(x)
 
 /* ========================================================================= */
 /*  File-based logging (persists across crashes, no debugger needed)         */
@@ -80,24 +88,61 @@ static void VddLog(const char* fmt, ...)
 }
 
 /* ========================================================================= */
-/*  EDID with computed checksum                                              */
+/*  Display mode (registry) and EDID                                         */
 /* ========================================================================= */
 
-static const BYTE* VddGetEdid()
-{
-    static BYTE edid[128];
-    static BOOL computed = FALSE;
+/* Set by VddLoadMode in DeviceAdd, before the monitor exists; read-only afterwards. */
+static VDD_MODE g_mode;
+static BYTE     g_edid[VDD_EDID_MAX_SIZE];
+static UINT     g_edidSize;
 
-    if (!computed)
-    {
-        memcpy(edid, VDD_EDID, 127);
-        BYTE sum = 0;
-        for (int i = 0; i < 127; i++)
-            sum += edid[i];
-        edid[127] = (BYTE)(256 - sum);
-        computed = TRUE;
+static BOOL VddRegDword(HKEY key, const wchar_t* name, DWORD* value)
+{
+    DWORD size = sizeof(*value);
+    return RegGetValueW(key, NULL, name, RRF_RT_REG_DWORD, NULL, value, &size) == ERROR_SUCCESS;
+}
+
+static void VddLoadMode(void)
+{
+    DWORD w = 0, h = 0, r = 0, wMm = 0, hMm = 0;
+    BOOL configured = FALSE;
+    HKEY key;
+
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, VDD_REG_KEY, 0, KEY_READ, &key) == ERROR_SUCCESS) {
+        configured = VddRegDword(key, L"Width", &w) && VddRegDword(key, L"Height", &h) &&
+                     VddRegDword(key, L"RefreshRate", &r);
+        if (!VddRegDword(key, L"WidthMm", &wMm) || !VddRegDword(key, L"HeightMm", &hMm))
+            wMm = hMm = 0;
+        RegCloseKey(key);
     }
-    return edid;
+
+    g_mode.width   = VDD_DEFAULT_WIDTH;
+    g_mode.height  = VDD_DEFAULT_HEIGHT;
+    g_mode.refresh = VDD_DEFAULT_REFRESH;
+    if (configured) {
+        if (w >= VDD_MIN_WIDTH && w <= VDD_MAX_DIMENSION && h >= VDD_MIN_HEIGHT && h <= VDD_MAX_DIMENSION &&
+            (UINT64)w * h <= VDD_MAX_PIXELS && r >= VDD_MIN_REFRESH && r <= VDD_MAX_REFRESH) {
+            g_mode.width   = w;
+            g_mode.height  = h;
+            g_mode.refresh = r;
+        } else {
+            VddLog("Mode: %lux%lu@%lu in the registry is out of range, using the stock mode", w, h, r);
+            configured = FALSE;
+        }
+    }
+    g_mode.stride     = g_mode.width * VDD_BPP;
+    g_mode.pixelBytes = (SIZE_T)g_mode.stride * g_mode.height;
+
+    /* EDID sizes: 12 bits of mm in a detailed timing, one byte of cm in the base block. */
+    g_mode.widthMm  = (wMm > 0 && wMm <= 2550 && hMm > 0 && hMm <= 2550) ? wMm : 0;
+    g_mode.heightMm = g_mode.widthMm ? hMm : 0;
+
+    g_edidSize = VddBuildEdid(g_mode.width, g_mode.height, g_mode.refresh,
+                              g_mode.widthMm, g_mode.heightMm, g_edid);
+
+    VddLog("Mode: %ux%u@%u (%s), size %ux%u mm, EDID %u bytes",
+           g_mode.width, g_mode.height, g_mode.refresh, configured ? "registry" : "stock",
+           g_mode.widthMm, g_mode.heightMm, g_edidSize);
 }
 
 /* ========================================================================= */
@@ -109,18 +154,18 @@ static void VddCreateMonitorMode(DISPLAYCONFIG_VIDEO_SIGNAL_INFO* sig, UINT vSyn
     /* totalSize == activeSize, pixelRate = refresh * w * h.
        IddCx validates these relationships; using actual blanking values causes
        STATUS_INVALID_PARAMETER from IddCxMonitorArrival. */
-    sig->totalSize.cx                           = VDD_WIDTH;
-    sig->totalSize.cy                           = VDD_HEIGHT;
-    sig->activeSize.cx                          = VDD_WIDTH;
-    sig->activeSize.cy                          = VDD_HEIGHT;
+    sig->totalSize.cx                           = g_mode.width;
+    sig->totalSize.cy                           = g_mode.height;
+    sig->activeSize.cx                          = g_mode.width;
+    sig->activeSize.cy                          = g_mode.height;
     sig->AdditionalSignalInfo.vSyncFreqDivider  = vSyncDivider;
     sig->AdditionalSignalInfo.videoStandard     = 255;
-    sig->vSyncFreq.Numerator                    = VDD_REFRESH;
+    sig->vSyncFreq.Numerator                    = g_mode.refresh;
     sig->vSyncFreq.Denominator                  = 1;
-    sig->hSyncFreq.Numerator                    = VDD_REFRESH * VDD_HEIGHT;
+    sig->hSyncFreq.Numerator                    = g_mode.refresh * g_mode.height;
     sig->hSyncFreq.Denominator                  = 1;
     sig->scanLineOrdering                       = DISPLAYCONFIG_SCANLINE_ORDERING_PROGRESSIVE;
-    sig->pixelRate                               = (UINT64)VDD_REFRESH * VDD_WIDTH * VDD_HEIGHT;
+    sig->pixelRate                               = (UINT64)g_mode.refresh * g_mode.width * g_mode.height;
 }
 
 /* ========================================================================= */
@@ -480,15 +525,15 @@ static void VddQueueFrame(VDD_SWAP_PROC* proc, const D3D11_MAPPED_SUBRESOURCE* m
     AcquireSRWLockExclusive(&proc->pendLock);
     if (proc->pendValid) full = TRUE;
     if (full) {
-        for (UINT row = 0; row < VDD_HEIGHT; row++)
-            memcpy(proc->pendBuf + (SIZE_T)row * VDD_STRIDE,
-                   (const BYTE*)m->pData + (SIZE_T)row * m->RowPitch, VDD_STRIDE);
+        for (UINT row = 0; row < g_mode.height; row++)
+            memcpy(proc->pendBuf + (SIZE_T)row * g_mode.stride,
+                   (const BYTE*)m->pData + (SIZE_T)row * m->RowPitch, g_mode.stride);
         proc->pendRectCount = 0;
     } else {
         for (UINT i = 0; i < rectCount; i++) {
             SIZE_T rowBytes = (SIZE_T)(rects[i].right - rects[i].left) * VDD_BPP;
             for (LONG y = rects[i].top; y < rects[i].bottom; y++)
-                memcpy(proc->pendBuf + (SIZE_T)y * VDD_STRIDE + (SIZE_T)rects[i].left * VDD_BPP,
+                memcpy(proc->pendBuf + (SIZE_T)y * g_mode.stride + (SIZE_T)rects[i].left * VDD_BPP,
                        (const BYTE*)m->pData + (SIZE_T)y * m->RowPitch + (SIZE_T)rects[i].left * VDD_BPP,
                        rowBytes);
         }
@@ -533,13 +578,13 @@ static DWORD WINAPI VddSendThread(LPVOID lpParameter)
 
         /* Full frames are already tight in buf; dirty rects are packed row by row. */
         const BYTE* data = buf;
-        UINT32 dataSize  = VDD_PIXEL_BYTES;
+        UINT32 dataSize  = (UINT32)g_mode.pixelBytes;
         if (!full) {
             PBYTE dst = proc->packBuf;
             for (UINT i = 0; i < rectCount; i++) {
                 SIZE_T rowBytes = (SIZE_T)(rects[i].right - rects[i].left) * VDD_BPP;
                 for (LONG y = rects[i].top; y < rects[i].bottom; y++) {
-                    memcpy(dst, buf + (SIZE_T)y * VDD_STRIDE + (SIZE_T)rects[i].left * VDD_BPP, rowBytes);
+                    memcpy(dst, buf + (SIZE_T)y * g_mode.stride + (SIZE_T)rects[i].left * VDD_BPP, rowBytes);
                     dst += rowBytes;
                 }
             }
@@ -554,9 +599,9 @@ static DWORD WINAPI VddSendThread(LPVOID lpParameter)
         if (s) {
             VDD_WIRE_FRAME_HEADER whdr;
             whdr.magic            = VDD_FRAME_MAGIC;
-            whdr.width            = VDD_WIDTH;
-            whdr.height           = VDD_HEIGHT;
-            whdr.stride           = VDD_STRIDE;
+            whdr.width            = g_mode.width;
+            whdr.height           = g_mode.height;
+            whdr.stride           = g_mode.stride;
             whdr.frame_seq        = ++proc->frameSeq;
             whdr.dirty_rect_count = full ? 0 : rectCount;
             BOOL ok = VddSendAll(s, (const char*)&whdr, sizeof(whdr)) == 0 &&
@@ -571,7 +616,7 @@ static DWORD WINAPI VddSendThread(LPVOID lpParameter)
                 statBytes += dataSize;
                 if (full) statFull++;
                 if (proc->frameSeq == 1)
-                    VddLog("Frame: first frame sent (%ux%u, %u bytes)", VDD_WIDTH, VDD_HEIGHT, dataSize);
+                    VddLog("Frame: first frame sent (%ux%u, %u bytes)", g_mode.width, g_mode.height, dataSize);
             }
         }
         ReleaseSRWLockExclusive(&proc->connLock);
@@ -583,7 +628,7 @@ static DWORD WINAPI VddSendThread(LPVOID lpParameter)
             double secs = (double)(now - statStart) / 1000.0;
             if (statFrames)
                 VddLog("Send: %ux%u fps=%.1f full=%u MB/s=%.1f send_ms/frame=%.2f busy=%.0f%%",
-                       VDD_WIDTH, VDD_HEIGHT, statFrames / secs, statFull,
+                       g_mode.width, g_mode.height, statFrames / secs, statFull,
                        (double)statBytes / (1024.0 * 1024.0) / secs,
                        statSendMs / statFrames, statSendMs / (secs * 10.0));
             statStart = now; statFrames = 0; statFull = 0; statBytes = 0; statSendMs = 0.0;
@@ -639,7 +684,7 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
        we have a valid frame in the staging texture for resend on idle. */
     BOOL bHasFrame = FALSE;
     BOOL bSentFullFrame = FALSE;   /* TRUE after first full frame sent to current client */
-    UINT cachedRowPitch = VDD_STRIDE;
+    UINT cachedRowPitch = g_mode.stride;
     /* Capture measurement: frames handed back to IddCx per second, and the time spent
        copying each into pendBuf. Sending is measured by VddSendThread. */
     ULONGLONG statStart = GetTickCount64();
@@ -788,8 +833,8 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
                                     RECT r = dirtyRects[i];
                                     if (r.left < 0) r.left = 0;
                                     if (r.top  < 0) r.top  = 0;
-                                    if (r.right  > (LONG)VDD_WIDTH)  r.right  = VDD_WIDTH;
-                                    if (r.bottom > (LONG)VDD_HEIGHT) r.bottom = VDD_HEIGHT;
+                                    if (r.right  > (LONG)g_mode.width)  r.right  = (LONG)g_mode.width;
+                                    if (r.bottom > (LONG)g_mode.height) r.bottom = (LONG)g_mode.height;
                                     if (r.left < r.right && r.top < r.bottom) dirtyRects[kept++] = r;
                                 }
                                 rectCount = kept;
@@ -806,7 +851,7 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
                                 if (now - statStart >= 1000) {
                                     double secs = (double)(now - statStart) / 1000.0;
                                     VddLog("Capture: %ux%u fps=%.1f copy_ms/frame=%.2f",
-                                           VDD_WIDTH, VDD_HEIGHT, statFrames / secs, statCopyMs / statFrames);
+                                           g_mode.width, g_mode.height, statFrames / secs, statCopyMs / statFrames);
                                     statStart = now; statFrames = 0; statCopyMs = 0.0;
                                 }
                             }
@@ -950,10 +995,6 @@ static void VddContextInit(VDD_DEVICE_CONTEXT* ctx, WDFDEVICE device)
 {
     memset(ctx, 0, sizeof(*ctx));
     ctx->wdfDevice = device;
-
-    /* Pre-populate the single 1920x1080@60Hz mode */
-    VddCreateMonitorMode(&ctx->modes[0], 0);  /* vSyncDivider=0 for monitor modes */
-    ctx->modeCount = 1;
 }
 
 static void VddContextCleanup(VDD_DEVICE_CONTEXT* ctx)
@@ -1082,12 +1123,11 @@ static NTSTATUS VddCreateMonitor(VDD_DEVICE_CONTEXT* ctx)
 
     monitorInfo.MonitorDescription.Size     = sizeof(monitorInfo.MonitorDescription);
     monitorInfo.MonitorDescription.Type     = IDDCX_MONITOR_DESCRIPTION_TYPE_EDID;
-    monitorInfo.MonitorDescription.DataSize = 128;
-    monitorInfo.MonitorDescription.pData    = (void*)VddGetEdid();
+    monitorInfo.MonitorDescription.DataSize = g_edidSize;
+    monitorInfo.MonitorDescription.pData    = g_edid;
 
-    VddLog("CreateMonitor: EDID checksum byte=0x%02X, IDDCX_MONITOR_INFO.Size=%u",
-           ((const BYTE*)monitorInfo.MonitorDescription.pData)[127],
-           (unsigned)monitorInfo.Size);
+    VddLog("CreateMonitor: EDID %u bytes, checksum byte=0x%02X, IDDCX_MONITOR_INFO.Size=%u",
+           g_edidSize, g_edid[127], (unsigned)monitorInfo.Size);
 
     /* Generate a container GUID */
     HRESULT hrGuid = CoCreateGuid(&monitorInfo.MonitorContainerId);
@@ -1226,8 +1266,8 @@ NTSTATUS VddMonitorAssignSwapChain(
     proc->frameSeq       = 0;
 
     /* Create staging texture for CPU readback */
-    VddLog("AssignSwapChain: creating staging texture (%ux%u)...", VDD_WIDTH, VDD_HEIGHT);
-    hr = VddCreateStagingTexture(proc, VDD_WIDTH, VDD_HEIGHT);
+    VddLog("AssignSwapChain: creating staging texture (%ux%u)...", g_mode.width, g_mode.height);
+    hr = VddCreateStagingTexture(proc, g_mode.width, g_mode.height);
     if (FAILED(hr))
     {
         VddLog("AssignSwapChain: staging texture creation FAILED hr=0x%08X", hr);
@@ -1242,9 +1282,9 @@ NTSTATUS VddMonitorAssignSwapChain(
     /* Decoupled sending: buffers, locks, and the send thread. */
     InitializeSRWLock(&proc->connLock);
     InitializeSRWLock(&proc->pendLock);
-    proc->pendBuf    = (PBYTE)malloc(VDD_PIXEL_BYTES);
-    proc->sendBuf    = (PBYTE)malloc(VDD_PIXEL_BYTES);
-    proc->packBuf    = (PBYTE)malloc(VDD_PIXEL_BYTES);
+    proc->pendBuf    = (PBYTE)malloc(g_mode.pixelBytes);
+    proc->sendBuf    = (PBYTE)malloc(g_mode.pixelBytes);
+    proc->packBuf    = (PBYTE)malloc(g_mode.pixelBytes);
     proc->hSendEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
     if (proc->pendBuf && proc->sendBuf && proc->packBuf && proc->hSendEvent)
         proc->hSendThread = CreateThread(NULL, 0, VddSendThread, proc, 0, NULL);
@@ -1259,7 +1299,7 @@ NTSTATUS VddMonitorAssignSwapChain(
         free(proc);
         return (NTSTATUS)0xC01E0012L; /* STATUS_GRAPHICS_INDIRECT_DISPLAY_ABANDON_SWAPCHAIN */
     }
-    VddLog("AssignSwapChain: send thread created (%u bytes x3)", (UINT)VDD_PIXEL_BYTES);
+    VddLog("AssignSwapChain: send thread created (%u bytes x3)", (UINT)g_mode.pixelBytes);
 
     /* Setup hardware cursor BEFORE starting swap chain thread — the thread
        reads proc->hCursorEvent at startup to build its wait handle array */
@@ -1385,7 +1425,7 @@ NTSTATUS VddParseMonitorDescription(
     VddCreateMonitorMode(&pMode->MonitorVideoSignalInfo, 0); /* vSyncDivider=0 for monitor modes */
 
     pOutArgs->PreferredMonitorModeIdx = 0;
-    VddLog("ParseMonitorDescription: returning 1 mode (%ux%u@%u)", VDD_WIDTH, VDD_HEIGHT, VDD_REFRESH);
+    VddLog("ParseMonitorDescription: returning 1 mode (%ux%u@%u)", g_mode.width, g_mode.height, g_mode.refresh);
     return STATUS_SUCCESS;
 }
 
@@ -1704,6 +1744,9 @@ NTSTATUS VddDeviceAdd(
 
     VddLog("DeviceAdd: entered");
 
+    /* Before IddCx init: the parse/query mode callbacks and the monitor's EDID use g_mode. */
+    VddLoadMode();
+
     /* PnP power callbacks FIRST */
     WDF_PNPPOWER_EVENT_CALLBACKS_INIT(&pnpCallbacks);
     pnpCallbacks.EvtDeviceD0Entry = VddDeviceD0Entry;
@@ -1845,7 +1888,7 @@ extern "C" NTSTATUS DriverEntry(
     PDRIVER_OBJECT pDriverObject,
     PUNICODE_STRING pRegistryPath)
 {
-    VddLog("DriverEntry: entered (pDriverObject=%p)", pDriverObject);
+    VddLog("DriverEntry: AppSandboxVDD %s (pDriverObject=%p)", VDD_STRINGIZE(VDD_VERSION), pDriverObject);
 
     WDF_DRIVER_CONFIG config;
     WDF_OBJECT_ATTRIBUTES attributes;

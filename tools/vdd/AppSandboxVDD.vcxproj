@@ -20,6 +20,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="vdd.cpp" />
+    <ClCompile Include="vdd_edid.cpp" />
     <!-- ivshmem transport (Windows-VMs-on-Mac frame path). Plain C; no WPP/PREfast. -->
     <ClCompile Include="..\transport\asb_transport.c">
       <CompileAs>CompileAsC</CompileAs>
@@ -30,6 +31,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="vdd.h" />
+    <ClInclude Include="vdd_edid.h" />
     <ClInclude Include="Trace.h" />
   </ItemGroup>
   <ItemGroup>
@@ -37,6 +39,13 @@
       <TimeStamp>$(AsbVersion)</TimeStamp>
     </Inf>
   </ItemGroup>
+  <!-- Build version for the DriverEntry log line (stringized in vdd.cpp), so a stale package
+       left loaded after an install shows up in AppSandboxVDD.log. -->
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <PreprocessorDefinitions>VDD_VERSION=$(AsbVersion);%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+  </ItemDefinitionGroup>
   <PropertyGroup Label="Globals">
     <ProjectGuid>{E1F2A3B4-C5D6-7890-ABCD-EF1234567890}</ProjectGuid>
     <TemplateGuid>{32909489-7be5-497b-aafa-db6669d9b44b}</TemplateGuid>

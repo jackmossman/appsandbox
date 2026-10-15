@@ -1,8 +1,9 @@
 ;
 ; AppSandboxVDD.inf - IddCx Virtual Display Driver for AppSandbox
 ;
-; Installs a UMDF2 indirect display driver that creates a single
-; 1920x1080 virtual monitor for GPU-PV VM frame capture.
+; Installs a UMDF2 indirect display driver that creates a single virtual
+; monitor for GPU-PV VM frame capture: 1920x1080@60, or the mode set under
+; HKLM\SOFTWARE\AppSandbox\VDD (see vdd.h).
 ;
 ; Windows 11+ only: the UMDF reflector (WUDFRd) is pulled in by referencing
 ; the inbox WudfRd.inf via Include/Needs. WudfRd.inf ships only with Windows
