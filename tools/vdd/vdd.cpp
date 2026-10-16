@@ -96,6 +96,7 @@ static void VddLog(const char* fmt, ...)
 static VDD_MODE g_mode;
 static BYTE     g_edid[VDD_EDID_MAX_SIZE];
 static UINT     g_edidSize;
+static BOOL     g_stats;        /* registry Stats: per-second throughput lines in the log */
 
 static BOOL VddRegDword(HKEY key, const wchar_t* name, DWORD* value)
 {
@@ -105,7 +106,7 @@ static BOOL VddRegDword(HKEY key, const wchar_t* name, DWORD* value)
 
 static void VddLoadMode(void)
 {
-    DWORD w = 0, h = 0, r = 0, wMm = 0, hMm = 0;
+    DWORD w = 0, h = 0, r = 0, wMm = 0, hMm = 0, stats = 0;
     BOOL configured = FALSE;
     HKEY key;
 
@@ -114,8 +115,10 @@ static void VddLoadMode(void)
                      VddRegDword(key, L"RefreshRate", &r);
         if (!VddRegDword(key, L"WidthMm", &wMm) || !VddRegDword(key, L"HeightMm", &hMm))
             wMm = hMm = 0;
+        VddRegDword(key, L"Stats", &stats);
         RegCloseKey(key);
     }
+    g_stats = stats != 0;
 
     g_mode.width   = VDD_DEFAULT_WIDTH;
     g_mode.height  = VDD_DEFAULT_HEIGHT;
@@ -141,9 +144,9 @@ static void VddLoadMode(void)
     g_edidSize = VddBuildEdid(g_mode.width, g_mode.height, g_mode.refresh,
                               g_mode.widthMm, g_mode.heightMm, g_edid);
 
-    VddLog("Mode: %ux%u@%u (%s), size %ux%u mm, EDID %u bytes",
+    VddLog("Mode: %ux%u@%u (%s), size %ux%u mm, EDID %u bytes%s",
            g_mode.width, g_mode.height, g_mode.refresh, configured ? "registry" : "stock",
-           g_mode.widthMm, g_mode.heightMm, g_edidSize);
+           g_mode.widthMm, g_mode.heightMm, g_edidSize, g_stats ? ", stats on" : "");
 }
 
 /* ========================================================================= */
@@ -735,7 +738,7 @@ static DWORD WINAPI VddSendThread(LPVOID lpParameter)
         ULONGLONG now = GetTickCount64();
         if (now - statStart >= 1000) {
             double secs = (double)(now - statStart) / 1000.0;
-            if (statFrames)
+            if (g_stats && statFrames)
                 VddLog("Send: %ux%u fps=%.1f full=%u MB/s=%.1f send_ms/frame=%.2f busy=%.0f%%",
                        w, h, statFrames / secs, statFull,
                        (double)statBytes / (1024.0 * 1024.0) / secs,
@@ -975,8 +978,9 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
                                 ULONGLONG now = GetTickCount64();
                                 if (now - statStart >= 1000) {
                                     double secs = (double)(now - statStart) / 1000.0;
-                                    VddLog("Capture: %ux%u fps=%.1f copy_ms/frame=%.2f",
-                                           proc->stagingW, proc->stagingH, statFrames / secs, statCopyMs / statFrames);
+                                    if (g_stats)
+                                        VddLog("Capture: %ux%u fps=%.1f copy_ms/frame=%.2f",
+                                               proc->stagingW, proc->stagingH, statFrames / secs, statCopyMs / statFrames);
                                     statStart = now; statFrames = 0; statCopyMs = 0.0;
                                 }
                             }

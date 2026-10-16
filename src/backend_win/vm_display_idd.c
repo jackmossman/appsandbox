@@ -217,11 +217,6 @@ struct VmDisplayIdd {
 
     UINT           render_count;     /* number of renders (for one-shot logging) */
     volatile UINT  recv_count;       /* number of frames received over HvSocket */
-    volatile ULONGLONG recv_bytes;   /* pixel bytes received (throughput measurement) */
-    ULONGLONG      stat_tick;        /* start of the current throughput window */
-    UINT           stat_recv;        /* recv_count at stat_tick */
-    ULONGLONG      stat_bytes;       /* recv_bytes at stat_tick */
-    double         stat_fps, stat_mbps;
 
     /* Input forwarding */
     volatile SOCKET input_socket;   /* input socket for keyboard/mouse forwarding */
@@ -1642,17 +1637,9 @@ static void d3d_render_frame(VmDisplayIdd *d)
     /* Refresh the title once per uploaded frame (~frame rate). */
     if (frame_uploaded && d->hwnd) {
         wchar_t title[256];
-        ULONGLONG now = GetTickCount64();
-        if (now - d->stat_tick >= 1000) {
-            double secs = (double)(now - d->stat_tick) / 1000.0;
-            d->stat_fps  = (d->recv_count - d->stat_recv) / secs;
-            d->stat_mbps = (double)(d->recv_bytes - d->stat_bytes) / (1024.0 * 1024.0) / secs;
-            d->stat_tick = now; d->stat_recv = d->recv_count; d->stat_bytes = d->recv_bytes;
-        }
-        swprintf_s(title, 256, L"%s%s Display %ux%u recv=%u fps=%.1f MB/s=%.1f",
+        swprintf_s(title, 256, L"%s%s Display %ux%u recv=%u",
                    d->audio_muted ? L"\U0001F507 " : L"",
-                   d->vm_name, d->frame_width, d->frame_height, d->recv_count,
-                   d->stat_fps, d->stat_mbps);
+                   d->vm_name, d->frame_width, d->frame_height, d->recv_count);
         SetWindowTextW(d->hwnd, title);
     }
     d->render_count++;
@@ -2157,7 +2144,6 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
 
             d->frame_dirty = TRUE;
             d->recv_count++;
-            d->recv_bytes += data_size;
             LeaveCriticalSection(&d->frame_cs);
             if (!d->frame_connected) {
                 d->frame_connected = TRUE;

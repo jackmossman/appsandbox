@@ -43,6 +43,8 @@ Environment:
  *  Read once per device start from HKLM\SOFTWARE\AppSandbox\VDD, DWORD values:
  *    Width, Height, RefreshRate   the single mode offered (all three, or none)
  *    WidthMm, HeightMm            optional physical size for the EDID (DPI scaling)
+ *    Stats                        nonzero: log capture/send throughput once a second
+ *                                 while the host viewer is connected
  *  Unset or out of range -> stock 1920x1080@60. The value has to exist before the
  *  device is first installed, so it lives in a fixed key rather than the device's
  *  own registry key. Restart the device to apply a change.
