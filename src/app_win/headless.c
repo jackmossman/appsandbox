@@ -29,6 +29,7 @@
 
 #include "headless.h"
 #include "asb_core.h"          /* full API incl. internal VmInstance */
+#include "vm_stream.h"         /* Moonlight for native display VMs */
 #include "webview2_bridge.h"   /* json_get_string/int/bool for request bodies */
 #include "prereq.h"            /* prereq_check_all -> VirtualMachinePlatform check */
 #include "vm_display_idd.h"    /* IDD display window, opened on demand via the API */
@@ -85,10 +86,15 @@ static void display_drop(DisplayEntry *e)   /* destroy the window + free the slo
     e->disp = NULL; e->vm_id = 0;
 }
 /* TRUE if this VM has a live (not user-closed) display window. */
-static BOOL display_is_open(UINT64 vm_id)
+static BOOL raw_display_is_open(UINT64 vm_id)
 {
     DisplayEntry *e = display_find(vm_id);
     return e && e->disp && vm_display_idd_is_open(e->disp);
+}
+/* ... or a running Moonlight stream (native display VMs). */
+static BOOL display_is_open(UINT64 vm_id)
+{
+    return raw_display_is_open(vm_id) || vm_stream_is_open(vm_id);
 }
 /* If the user closed the window (X), vm_display_idd has already stopped its threads
    and freed the vsock frame connection (WM_CLOSE handler); drop our now-dead handle
@@ -195,6 +201,7 @@ static DWORD WINAPI bootstrap_thread(LPVOID p)
     (void)p;
     asb_init();
     asb_reconnect_running();
+    vm_stream_init(NULL);   /* headless clients open the stream once GET .../display says streamReady */
     InterlockedExchange(&g_init_done, 1);
     for (;;) Sleep(60000);   /* park; never exit */
 }
@@ -933,7 +940,10 @@ static int handle_request(PHTTP_REQUEST req)
                          "wait for the build to finish, then delete");
                 return 0;
             }
-            if (dv) display_drop(display_find(dv->unique_id));   /* close its display window first */
+            if (dv) {   /* close its display window / stream first */
+                display_drop(display_find(dv->unique_id));
+                vm_stream_close(dv->unique_id);
+            }
             send_hr(req->RequestId, "delete", nu, asb_vm_delete(vm));
             return 0;
         }
@@ -980,6 +990,14 @@ static int handle_request(PHTTP_REQUEST req)
                              "the VM's virtual display driver is not up yet; retry shortly");
                     return 0;
                 }
+                /* Native display VMs stream to Moonlight once it is paired; until then (GET's
+                   "streamReady" false) they get the raw viewer like any other VM. */
+                if (vm_stream_open(v)) {
+                    display_drop(display_find(v->unique_id));
+                    send_json(req->RequestId, 200, "OK",
+                              "{\"ok\":true,\"displayOpen\":true,\"viewer\":\"moonlight\"}");
+                    return 0;
+                }
                 e = display_find(v->unique_id);   /* present => still open (a closed one was reaped above) */
                 if (e) {
                     vm_display_idd_focus(e->disp);            /* already open -> bring to front */
@@ -1005,6 +1023,7 @@ static int handle_request(PHTTP_REQUEST req)
             }
             if (verb == HttpVerbDELETE) {
                 display_drop(display_find(v->unique_id));
+                vm_stream_close(v->unique_id);
                 send_json(req->RequestId, 200, "OK", "{\"ok\":true,\"displayOpen\":false}");
                 return 0;
             }
@@ -1013,11 +1032,13 @@ static int handle_request(PHTTP_REQUEST req)
                    asb_vm_idd_ready: running + agent-online + the agent's latched
                    idd_status flag, so a client can poll this on an interval (it disturbs
                    nothing) and POST to open once ready. */
-                char b[160];
+                char b[200];
                 BOOL open = display_is_open(v->unique_id);
                 BOOL ready = open || asb_vm_idd_ready(vm);
-                sprintf_s(b, sizeof(b), "{\"open\":%s,\"ready\":%s}",
-                          open ? "true" : "false", ready ? "true" : "false");
+                sprintf_s(b, sizeof(b), "{\"open\":%s,\"ready\":%s,\"viewer\":\"%s\",\"streamReady\":%s}",
+                          open ? "true" : "false", ready ? "true" : "false",
+                          vm_stream_is_open(v->unique_id) ? "moonlight" : raw_display_is_open(v->unique_id) ? "raw" : "none",
+                          vm_stream_is_ready(v->unique_id) ? "true" : "false");
                 send_json(req->RequestId, 200, "OK", b);
                 return 0;
             }
@@ -1394,6 +1415,7 @@ int run_headless(HINSTANCE hInst, const wchar_t *cmdline)
     free(req);
 
     { int i; for (i = 0; i < ASB_MAX_VMS; i++) display_drop(&g_displays[i]); }   /* close display windows */
+    vm_stream_shutdown();   /* and Moonlight */
 
     /* The daemon OWNS its VMs: exit terminates them (asb_cleanup stops the
        per-VM monitor/agent/ssh-proxy threads, hcs_terminate_vm's every running
