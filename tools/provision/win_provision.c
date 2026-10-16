@@ -307,6 +307,10 @@ int asb_provision_native_display(FILE *f, const AsbNativeDisplayProvision *nd) {
             "reg add HKLM\\SOFTWARE\\AppSandbox\\VDD /v WidthMm /t REG_DWORD /d %u /f >> \"%%LOG%%\" 2>&1\r\n"
             "reg add HKLM\\SOFTWARE\\AppSandbox\\VDD /v HeightMm /t REG_DWORD /d %u /f >> \"%%LOG%%\" 2>&1\r\n",
             nd->width_mm, nd->height_mm);
+    if (nd->scale)
+        fprintf(f,
+            "reg add HKLM\\SOFTWARE\\AppSandbox\\Streaming /v Scale /t REG_DWORD /d %u /f >> \"%%LOG%%\" 2>&1\r\n",
+            nd->scale);
     fprintf(f,
         "reg add HKLM\\SOFTWARE\\AppSandbox\\Streaming /v Enabled /t REG_DWORD /d 1 /f >> \"%%LOG%%\" 2>&1\r\n"
         "reg add HKLM\\SOFTWARE\\AppSandbox\\Streaming /v AllowedSubnet /t REG_SZ /d %s /f >> \"%%LOG%%\" 2>&1\r\n"

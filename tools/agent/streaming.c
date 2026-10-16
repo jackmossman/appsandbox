@@ -55,6 +55,7 @@ static DWORD         g_sunshine_session = 0xFFFFFFFF;
 static SRWLOCK       g_subnet_lock = SRWLOCK_INIT;   /* g_subnet, g_new_subnet */
 static wchar_t       g_new_subnet[64];      /* from set_ip, applied by the thread; "" = none */
 static volatile LONG g_layout_now;          /* the raw viewer asked for a size: apply it next loop */
+static BOOL g_scale_done;                   /* host scaling applied (or not wanted) for this boot */
 
 #define VDD_REG_KEY         L"SOFTWARE\\AppSandbox\\VDD"
 
@@ -449,9 +450,26 @@ static void apply_firewall(void)
 
 /* ---- session ---- */
 
+/* Transparency effects off, once per user (appsandbox-displays --no-transparency). */
+static void apply_transparency_default(HANDLE token)
+{
+    wchar_t exe[MAX_PATH], cmd[MAX_PATH + 32], *slash;
+    char out[64];
+    DWORD code = 0;
+
+    GetModuleFileNameW(NULL, exe, MAX_PATH);
+    slash = wcsrchr(exe, L'\\');
+    if (slash) *(slash + 1) = L'\0';
+    wcscat_s(exe, MAX_PATH, L"appsandbox-displays.exe");
+    swprintf_s(cmd, MAX_PATH + 32, L"\"%s\" --no-transparency", exe);
+    if (run_as_user(token, cmd, NULL, 15000, out, sizeof(out), &code, NULL) && strcmp(out, "kept") != 0)
+        LOG("Streaming: transparency effects default: %s (exit %lu).", out[0] ? out : "(no output)", code);
+}
+
 /* Make the App Sandbox display the only one, primary, at the raw viewer's size (registry
-   ViewerWidth/ViewerHeight, which the VDD offers as a mode) or else native. FALSE on error. */
-static BOOL apply_layout(HANDLE token)
+   ViewerWidth/ViewerHeight, which the VDD offers as a mode) or else native. FALSE on error;
+   *native says whether the display is now at its native mode. */
+static BOOL apply_layout(HANDLE token, BOOL *native)
 {
     wchar_t exe[MAX_PATH], cmd[MAX_PATH + 48], size[32] = L"", *slash;
     char out[256];
@@ -464,6 +482,7 @@ static BOOL apply_layout(HANDLE token)
             swprintf_s(size, 32, L" %lux%lu", w, h);
         RegCloseKey(key);
     }
+    *native = size[0] == L'\0';
     GetModuleFileNameW(NULL, exe, MAX_PATH);
     slash = wcsrchr(exe, L'\\');
     if (slash) *(slash + 1) = L'\0';
@@ -473,6 +492,32 @@ static BOOL apply_layout(HANDLE token)
     if (strncmp(out, "ok ", 3) != 0)
         LOG("Streaming: display layout%ls: %s (exit %lu).", size, out[0] ? out : "(no output)", code);
     return code == 0;
+}
+
+/* The host monitor's scaling (registry Streaming\Scale, written at provisioning), once per user
+   (appsandbox-displays --scale). Windows keeps scaling as steps from the scale it recommends for
+   the current mode, so it is set only at the native mode, the one the host value is for. */
+static void apply_scale_default(HANDLE token)
+{
+    wchar_t exe[MAX_PATH], cmd[MAX_PATH + 32], *slash;
+    char out[64];
+    DWORD scale = 0, len = sizeof(scale), code = 1;
+
+    if (g_scale_done) return;
+    if (RegGetValueW(HKEY_LOCAL_MACHINE, STREAM_REG_KEY, L"Scale", RRF_RT_REG_DWORD, NULL, &scale, &len) != ERROR_SUCCESS ||
+        scale < 100 || scale > 500) {
+        g_scale_done = TRUE;
+        return;
+    }
+    GetModuleFileNameW(NULL, exe, MAX_PATH);
+    slash = wcsrchr(exe, L'\\');
+    if (slash) *(slash + 1) = L'\0';
+    wcscat_s(exe, MAX_PATH, L"appsandbox-displays.exe");
+    swprintf_s(cmd, MAX_PATH + 32, L"\"%s\" --scale %lu", exe, scale);
+    if (!run_as_user(token, cmd, NULL, 15000, out, sizeof(out), &code, NULL)) return;
+    if (code == 0) g_scale_done = TRUE;
+    if (strcmp(out, "kept") != 0)
+        LOG("Streaming: display scaling default %lu%%: %s (exit %lu).", scale, out[0] ? out : "(no output)", code);
 }
 
 /* Apply Sunshine web UI credentials waiting in the registry, then delete the password. Run as
@@ -579,7 +624,10 @@ static DWORD WINAPI streaming_thread(LPVOID param)
                         g_sunshine = NULL;
                     }
                     if (now >= next_start) {
-                        apply_layout(token);
+                        BOOL native;
+                        apply_transparency_default(token);
+                        if (apply_layout(token, &native) && native)
+                            apply_scale_default(token);
                         apply_credentials(token);
                         start_sunshine(token, session);
                         last_layout = now;
@@ -588,9 +636,12 @@ static DWORD WINAPI streaming_thread(LPVOID param)
                 } else if (g_layout_now || now - last_layout >= LAYOUT_INTERVAL_MS) {
                     /* A new raw viewer size waits for the VDD to offer it (it polls once a
                        second), so a failed switch is retried on the next loop. */
-                    BOOL requested = InterlockedExchange(&g_layout_now, 0) != 0;
-                    if (!apply_layout(token) && requested)
-                        InterlockedExchange(&g_layout_now, 1);
+                    BOOL requested = InterlockedExchange(&g_layout_now, 0) != 0, native;
+                    if (!apply_layout(token, &native)) {
+                        if (requested) InterlockedExchange(&g_layout_now, 1);
+                    } else if (native) {
+                        apply_scale_default(token);
+                    }
                     last_layout = now;
                 }
                 CloseHandle(token);

@@ -71,11 +71,12 @@ typedef struct {
     DWORD  display_width, display_height, display_refresh;
 } AsbVmConfig;
 
-/* The host's primary display: current mode and the monitor's physical size from its EDID
-   (0 when unknown). */
+/* The host's primary display: current mode, the monitor's physical size from its EDID
+   (0 when unknown) and its display scaling in percent. */
 typedef struct {
     DWORD width, height, refresh;
     DWORD width_mm, height_mm;
+    DWORD scale;
 } AsbHostDisplay;
 
 /* ---- Snapshot/branch info (returned by query functions) ---- */

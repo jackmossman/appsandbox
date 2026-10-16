@@ -313,9 +313,9 @@ static int build_host_info(char *buf, int cap)
         AsbHostDisplay hd;
         if (asb_host_display(&hd))
             pos += sprintf_s(buf + pos, cap - pos,
-                ",\"display\":{\"width\":%lu,\"height\":%lu,\"refresh\":%lu,\"widthMm\":%lu,\"heightMm\":%lu}",
+                ",\"display\":{\"width\":%lu,\"height\":%lu,\"refresh\":%lu,\"widthMm\":%lu,\"heightMm\":%lu,\"scale\":%lu}",
                 (unsigned long)hd.width, (unsigned long)hd.height, (unsigned long)hd.refresh,
-                (unsigned long)hd.width_mm, (unsigned long)hd.height_mm);
+                (unsigned long)hd.width_mm, (unsigned long)hd.height_mm, (unsigned long)hd.scale);
     }
     pos += sprintf_s(buf + pos, cap - pos, ",\"gpus\":[");
     for (i = 0; gpus && i < gpus->count; i++) {

@@ -271,6 +271,8 @@ struct VmDisplayIdd {
     BOOL           fit_guest;
     UINT           native_w, native_h;
     UINT           want_w, want_h;  /* the size last asked of the guest */
+    ULONGLONG      want_tick;       /* when it was (re)sent; 0 once frames arrive at that size */
+    UINT           want_resends;
 
     /* Clipboard (extracted to vm_clipboard.c) */
     VmClipboard      clipboard;
@@ -306,6 +308,7 @@ static const wchar_t *IDD_LOG_CLASS     = L"AppSandboxIddLog";
 #define IDM_AUDIO_MUTE     0x1000
 #define IDM_XMIT_HOTKEYS   0x1010
 #define IDM_SHOW_LOG       0x1020
+#define IDM_GUEST_DEFAULT     0x1030   /* native display VMs: back to the default 1920x1080 */
 static BOOL g_idd_class_registered;
 static WNDPROC g_orig_listbox_proc;
 static SRWLOCK g_mouse_capture_lock = SRWLOCK_INIT;
@@ -2224,21 +2227,48 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
  * ================================================================== */
 
 /* Native display VMs: ask the guest to run at the largest VDD mode that fits avail_w x avail_h. */
+static void idd_send_guest_size(VmDisplayIdd *d)
+{
+    char cmd[48];
+    sprintf_s(cmd, sizeof(cmd), "viewer_size:%ux%u", d->want_w, d->want_h);
+    vm_agent_send(d->vm, cmd, NULL, 0, 0);   /* fire-and-forget; the guest switches in ~1-3 s */
+    d->want_tick = GetTickCount64();
+}
+
 static void idd_request_guest_size(VmDisplayIdd *d, UINT avail_w, UINT avail_h)
 {
     unsigned w, h;
-    char cmd[48];
     if (!d->fit_guest || !avail_w || !avail_h) return;
     vdd_fit_mode(d->native_w, d->native_h, avail_w, avail_h, &w, &h);
     if (w == d->want_w && h == d->want_h) return;
     d->want_w = w;
     d->want_h = h;
+    d->want_resends = 0;
     d->vm->viewer_width = w;
     d->vm->viewer_height = h;
     asb_save();
-    sprintf_s(cmd, sizeof(cmd), "viewer_size:%ux%u", w, h);
-    vm_agent_send(d->vm, cmd, NULL, 0, 0);   /* fire-and-forget; the guest switches in ~1-3 s */
+    idd_send_guest_size(d);
     ui_log(L"\"%s\": raw viewer asks the guest for %ux%u (window %ux%u).", d->vm_name, w, h, avail_w, avail_h);
+}
+
+/* A request can be lost while the agent connection settles (seen right after boot): if frames
+   have not arrived at the asked size within 5 s, ask again, up to 3 times. */
+static void idd_check_guest_size(VmDisplayIdd *d)
+{
+    if (!d->fit_guest || !d->want_tick) return;
+    if (d->frame_width == d->want_w && d->frame_height == d->want_h) {
+        d->want_tick = 0;
+        return;
+    }
+    if (GetTickCount64() - d->want_tick < 5000) return;
+    if (d->want_resends >= 3) {
+        d->want_tick = 0;
+        ui_log(L"\"%s\": the guest did not switch to %ux%u.", d->vm_name, d->want_w, d->want_h);
+        return;
+    }
+    d->want_resends++;
+    idd_send_guest_size(d);
+    ui_log(L"\"%s\": raw viewer asks the guest again for %ux%u.", d->vm_name, d->want_w, d->want_h);
 }
 
 /* After the user resizes: fit the guest to the window's client area. */
@@ -2297,6 +2327,8 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
             AppendMenuW(sysmenu, MF_STRING, IDM_SHOW_LOG, L"Show Log");
             CheckMenuItem(sysmenu, IDM_XMIT_HOTKEYS,
                           MF_BYCOMMAND | (d->transmit_hotkeys ? MF_CHECKED : MF_UNCHECKED));
+            if (d->fit_guest)
+                AppendMenuW(sysmenu, MF_STRING, IDM_GUEST_DEFAULT, L"Resize to default");
         }
     }
 
@@ -2451,6 +2483,20 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                         : L"Transmit Keyboard Hotkeys: OFF.");
             return 0;
         }
+        if (d && d->fit_guest && (wp & 0xFFF0) == IDM_GUEST_DEFAULT) {
+            /* Back to the default size: the window's inside to 1920x1080 (or the nearest mode
+               when native is smaller), and the guest follows. */
+            DWORD style   = (DWORD)GetWindowLongW(hwnd, GWL_STYLE);
+            DWORD exstyle = (DWORD)GetWindowLongW(hwnd, GWL_EXSTYLE);
+            RECT wr;
+            if (IsZoomed(hwnd) || IsIconic(hwnd)) ShowWindow(hwnd, SW_RESTORE);
+            idd_request_guest_size(d, 1920, 1080);
+            wr.left = 0; wr.top = 0; wr.right = (LONG)d->want_w; wr.bottom = (LONG)d->want_h;
+            AdjustWindowRectEx(&wr, style, FALSE, exstyle);
+            SetWindowPos(hwnd, NULL, 0, 0, wr.right - wr.left, wr.bottom - wr.top,
+                         SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+            return 0;
+        }
         if (d && (wp & 0xFFF0) == IDM_SHOW_LOG) {
             /* Reveal the log window (hidden by default). Closing it via its
                own [X] just hides it again (see idd_log_proc WM_CLOSE), so
@@ -2577,7 +2623,10 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             GetClientRect(hwnd, &rc);
             if (d->render_hwnd)
                 MoveWindow(d->render_hwnd, 0, 0, rc.right, rc.bottom, TRUE);
-            d3d_resize_swap_chain(d);
+            /* During a drag, skip the swap chain resize (and rendering, below): redrawing a large
+               frame on every mouse move made dragging slow. WM_EXITSIZEMOVE catches up. */
+            if (!d->input_sizing)
+                d3d_resize_swap_chain(d);
             if (d->relative_mouse) {
                 AcquireSRWLockExclusive(&g_mouse_capture_lock);
                 if (g_mouse_capture_hwnd == hwnd) idd_clip_mouse(d);
@@ -2621,8 +2670,11 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (d) {
             d->input_sizing = msg == WM_ENTERSIZEMOVE;
             idd_update_relative_mouse(d);
-            if (msg == WM_EXITSIZEMOVE)
+            if (msg == WM_EXITSIZEMOVE) {
+                d3d_resize_swap_chain(d);
+                d3d_render_frame(d);
                 idd_fit_guest_to_window(d);
+            }
         }
         break;
 
@@ -2630,7 +2682,7 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     {
         PAINTSTRUCT ps;
         BeginPaint(hwnd, &ps);
-        if (d) d3d_render_frame(d);
+        if (d && !d->input_sizing) d3d_render_frame(d);
         EndPaint(hwnd, &ps);
         return 0;
     }
@@ -2638,7 +2690,8 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_TIMER:
         if (wp == IDT_PRESENT && d) {
             if (d->mouse_sync_pending) idd_poll_mouse_position(d);
-            if (d->frame_dirty)
+            idd_check_guest_size(d);
+            if (d->frame_dirty && !d->input_sizing)
                 d3d_render_frame(d);
         }
         return 0;

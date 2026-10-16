@@ -28,10 +28,12 @@
 #include <setupapi.h>
 #include <bcrypt.h>
 #include <wincrypt.h>
+#include <shellscalingapi.h>
 #pragma comment(lib, "virtdisk.lib")
 #pragma comment(lib, "setupapi.lib")
 #pragma comment(lib, "bcrypt.lib")
 #pragma comment(lib, "crypt32.lib")
+#pragma comment(lib, "shcore.lib")
 
 /* ---- DLL module handle (for locating iso-patch.exe, resources, etc.) ---- */
 
@@ -165,6 +167,9 @@ ASB_API BOOL asb_host_display(AsbHostDisplay *out)
 {
     DISPLAY_DEVICEW adapter, monitor;
     DEVMODEW dm;
+    DPI_AWARENESS_CONTEXT old;
+    POINT origin = { 0, 0 };
+    UINT dpi_x = 0, dpi_y = 0;
     DWORD i;
 
     if (!out) return FALSE;
@@ -186,6 +191,13 @@ ASB_API BOOL asb_host_display(AsbHostDisplay *out)
     monitor.cb = sizeof(monitor);
     if (EnumDisplayDevicesW(adapter.DeviceName, 0, &monitor, EDD_GET_DEVICE_INTERFACE_NAME))
         monitor_size_mm(monitor.DeviceID, &out->width_mm, &out->height_mm);
+
+    /* Only a per-monitor aware thread sees the monitor's own scaling. */
+    old = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    if (SUCCEEDED(GetDpiForMonitor(MonitorFromPoint(origin, MONITOR_DEFAULTTOPRIMARY), MDT_EFFECTIVE_DPI,
+                                   &dpi_x, &dpi_y)) && dpi_x)
+        out->scale = (dpi_x * 100 + 48) / 96;
+    if (old) SetThreadDpiAwarenessContext(old);
     return TRUE;
 }
 
@@ -310,6 +322,7 @@ static const AsbNativeDisplayProvision *native_display_provision(const VmConfig 
     b->nd.refresh = cfg->display_refresh;
     b->nd.width_mm = cfg->display_width_mm;
     b->nd.height_mm = cfg->display_height_mm;
+    b->nd.scale = cfg->display_scale;
     b->nd.allowed_subnet = b->subnet;
     b->nd.user = b->user;
     b->nd.password = b->password;
@@ -324,6 +337,7 @@ static void copy_native_display(VmInstance *inst, const VmConfig *cfg)
     inst->display_refresh = cfg->display_refresh;
     inst->display_width_mm = cfg->display_width_mm;
     inst->display_height_mm = cfg->display_height_mm;
+    inst->display_scale = cfg->display_scale;
     wcscpy_s(inst->stream_user, ARRAYSIZE(inst->stream_user), cfg->stream_user);
     wcscpy_s(inst->stream_password, ARRAYSIZE(inst->stream_password), cfg->stream_password);
 }
@@ -810,6 +824,8 @@ static void save_vm_list(void)
             if (g_vms[i].display_width_mm && g_vms[i].display_height_mm)
                 fwprintf(f, L"DisplaySizeMm=%lux%lu\n", g_vms[i].display_width_mm,
                          g_vms[i].display_height_mm);
+            if (g_vms[i].display_scale)
+                fwprintf(f, L"DisplayScale=%lu\n", g_vms[i].display_scale);
             if (g_vms[i].viewer_width && g_vms[i].viewer_height)
                 fwprintf(f, L"ViewerSize=%lux%lu\n", g_vms[i].viewer_width, g_vms[i].viewer_height);
             fwprintf(f, L"StreamUser=%s\n", g_vms[i].stream_user);
@@ -989,6 +1005,8 @@ static void load_vm_list(void)
             if (swscanf_s(line + 14, L"%lux%lu", &vm->display_width_mm, &vm->display_height_mm) != 2)
                 vm->display_width_mm = vm->display_height_mm = 0;
         }
+        else if (wcsncmp(line, L"DisplayScale=", 13) == 0)
+            vm->display_scale = (DWORD)_wtoi(line + 13);
         else if (wcsncmp(line, L"ViewerSize=", 11) == 0) {
             if (swscanf_s(line + 11, L"%lux%lu", &vm->viewer_width, &vm->viewer_height) != 2)
                 vm->viewer_width = vm->viewer_height = 0;
@@ -3467,18 +3485,20 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
         cfg.test_mode = TRUE;   /* the VDD build with configurable modes is test-signed */
         native_display_mode(config->display_width, config->display_height, config->display_refresh,
                             &cfg.display_width, &cfg.display_height, &cfg.display_refresh);
-        /* Streamed full screen to the host monitor, so the guest gets that monitor's size (DPI). */
+        /* Streamed full screen to the host monitor, so the guest gets that monitor's size (DPI)
+           and scaling. */
         if (asb_host_display(&host)) {
             cfg.display_width_mm = host.width_mm;
             cfg.display_height_mm = host.height_mm;
+            cfg.display_scale = host.scale;
         }
         wcscpy_s(cfg.stream_user, ARRAYSIZE(cfg.stream_user), L"appsandbox");
         if (!generate_stream_password(cfg.stream_password, ARRAYSIZE(cfg.stream_password))) {
             asb_log(L"Error: Cannot generate the streaming password.");
             return E_FAIL;
         }
-        asb_log(L"Native display: %lux%lu@%lu, %lux%lu mm.", cfg.display_width, cfg.display_height,
-                cfg.display_refresh, cfg.display_width_mm, cfg.display_height_mm);
+        asb_log(L"Native display: %lux%lu@%lu, %lux%lu mm, %lu%% scaling.", cfg.display_width, cfg.display_height,
+                cfg.display_refresh, cfg.display_width_mm, cfg.display_height_mm, cfg.display_scale);
     }
 
     /* Defaults */

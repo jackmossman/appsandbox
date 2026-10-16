@@ -47,6 +47,7 @@ int asb_provision_setupcomplete(FILE *f, const char *ssh_msi_name);
 typedef struct {
     unsigned    width, height, refresh;     /* HKLM\SOFTWARE\AppSandbox\VDD */
     unsigned    width_mm, height_mm;        /* EDID physical size; 0 = derived by the driver */
+    unsigned    scale;                      /* Streaming\Scale, guest scaling in percent; 0 = Windows' choice */
     const char *allowed_subnet;             /* HKLM\SOFTWARE\AppSandbox\Streaming, e.g. "192.168.42.0/24" */
     const char *user, *password;            /* Sunshine web UI credentials, letters and digits only */
 } AsbNativeDisplayProvision;

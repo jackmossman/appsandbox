@@ -255,6 +255,7 @@ static void build_host_info_json(JsonBuilder *jb)
             jb_int(jb, L"refresh", (int)hd.refresh);
             jb_int(jb, L"widthMm", (int)hd.width_mm);
             jb_int(jb, L"heightMm", (int)hd.height_mm);
+            jb_int(jb, L"scale", (int)hd.scale);
             jb_object_end(jb);
         }
     }
