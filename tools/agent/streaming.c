@@ -315,6 +315,8 @@ static void prepare_config(void)
                "capture = wgc\n"
                "origin_web_ui_allowed = lan\n"
                "min_log_level = info\n"
+               /* No gamepads on a desktop VM; probing for them adds ~16 s to Sunshine's start. */
+               "controller = disabled\n"
                "log_path = %ls\\sunshine.log\n", cfg);
     fclose(f);
 }

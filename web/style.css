@@ -364,6 +364,13 @@ th.icon-col, td.icon-col {
 .agent-dot.online { background: var(--success); }
 .agent-dot.disabled { background: var(--text-dim); }
 
+/* Native display dot: the stream's state (vm_stream.h VmStreamState) */
+.native-dot.s0 { background: var(--text-dim); }
+.native-dot.s1 { background: var(--warning); }
+.native-dot.s2 { background: var(--success); }
+.native-dot.s3 { background: #e8820c; }
+.native-dot.s4 { background: #c80000; }
+
 /* Status text */
 .status-running { color: var(--success); font-weight: 600; }
 .status-shutting-down { color: var(--warning); font-weight: 600; }

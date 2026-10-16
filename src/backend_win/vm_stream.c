@@ -18,8 +18,10 @@
  * address it waits forever ("Found unexpected PC"). A stream that reports an error, exits, or has
  * not started within STREAM_START_MS is ended; the VM is paired again from scratch and the stream
  * relaunched once. Each slot keeps a one-line status for the GUI and the API.
- * vm_stream_open only launches, so it is safe on the UI thread and the API request loop; until a VM
- * is ready it returns FALSE and the caller opens the raw viewer.
+ * vm_stream_open only launches, so it is safe on the UI thread and the API request loop. Until a VM
+ * is ready the GUI queues the open: Moonlight opens once the VM is ready. Someone is waiting for that
+ * window, so failed pairings are retried every OPEN_RETRY_MS instead of backing off, for up to
+ * OPEN_RETRY_FOR_MS after the first failure.
  */
 
 #include <winsock2.h>
@@ -49,12 +51,15 @@
 #define SUNSHINE_API_PORT   47990       /* web API, HTTPS */
 #define SUNSHINE_HTTP_PORT  47989       /* serverinfo, HTTP */
 
-#define CHECK_RETRY_MS      10000       /* between checks while Sunshine is not up yet */
+#define CHECK_RETRY_MS      2000        /* between checks while Sunshine is not up yet (one HTTP request) */
+#define OPEN_RETRY_MS       10000       /* between pairing attempts while an open is waiting */
+#define OPEN_RETRY_FOR_MS   60000       /* ... for this long after the first failure, then give up */
 #define PAIR_RETRY_MS       60000       /* after a failed pairing, doubling to PAIR_RETRY_MAX_MS: each */
 #define PAIR_RETRY_MAX_MS   600000      /* attempt can show a Moonlight dialog on failure */
 #define NO_DISPLAY_RETRY_MS 15000       /* while the host has no display (Moonlight cannot start) */
 #define STREAM_START_MS     30000       /* a launched stream must start its video within this */
 #define STREAM_RELAUNCHES   1           /* automatic relaunches after a failed stream, per open */
+#define PAIR_FAILS_ATTENTION 3          /* failed pairings in a row before the state turns red */
 
 typedef struct {
     UINT64      vm_id;
@@ -64,7 +69,9 @@ typedef struct {
     FILETIME    launched_ft;    /* the same, as wall time: picks this launch's Moonlight log */
     BOOL        watching;       /* launched, video not started yet */
     BOOL        force_pair;     /* pair again even if both sides hold a pairing */
-    BOOL        relaunch;       /* launch again once ready */
+    BOOL        want_open;      /* launch once ready: a queued open, or a relaunch after a failure */
+    ULONGLONG   want_until;     /* when failed pairings give up on want_open (0: none failed yet) */
+    BOOL        open_gave_up;   /* want_open ended unopened: red until ready or opened again */
     int         relaunches;     /* automatic relaunches since the last open */
     ULONGLONG   next_check;     /* earliest next pairing check */
     ULONGLONG   pair_wait;      /* current wait after a failed pairing */
@@ -72,6 +79,9 @@ typedef struct {
     char        uuid[64];       /* deleted VM's Moonlight records can be removed */
     wchar_t     name[64];
     wchar_t     status[200];    /* one line for the GUI and the API */
+    VmStreamState state;        /* the same, as the GUI's Native column colour */
+    wchar_t     logged[200];    /* the last status written to the log */
+    int         pair_failures;  /* failed pairings in a row */
     wchar_t     last_error[160];/* why the last stream failed, until one starts */
 } StreamSlot;
 
@@ -90,12 +100,13 @@ static StreamSlot       g_slots[ASB_MAX_VMS];
 static CRITICAL_SECTION g_lock;                 /* g_slots */
 static HANDLE           g_thread;
 static volatile BOOL    g_running;
-static VmStreamReadyFn  g_on_ready;
+static VmStreamChangedFn g_on_changed;
 static wchar_t          g_base[MAX_PATH];       /* %ProgramData%\AppSandbox */
 static wchar_t          g_dir[MAX_PATH];        /* <base>\Moonlight */
 static wchar_t          g_exe[MAX_PATH];        /* <dir>\Moonlight.exe */
 static wchar_t          g_ini[MAX_PATH];        /* Moonlight's portable settings */
 static volatile BOOL    g_installed;
+static volatile BOOL    g_install_failed;       /* the last install attempt failed */
 static wchar_t          g_rule_subnet[32];      /* subnet of the current firewall rule */
 
 /* ---- helpers ---- */
@@ -116,12 +127,44 @@ static StreamSlot *slot_find(UINT64 vm_id, BOOL add)   /* caller holds g_lock */
     return NULL;
 }
 
-static void set_status(StreamSlot *s, const wchar_t *fmt, ...)   /* caller holds g_lock */
+static void set_status(StreamSlot *s, VmStreamState state, const wchar_t *fmt, ...)   /* caller holds g_lock */
 {
+    wchar_t text[ARRAYSIZE(s->status)];
     va_list ap;
     va_start(ap, fmt);
-    _vsnwprintf_s(s->status, ARRAYSIZE(s->status), _TRUNCATE, fmt, ap);   /* reasons can be long */
+    _vsnwprintf_s(text, ARRAYSIZE(text), _TRUNCATE, fmt, ap);   /* reasons can be long */
     va_end(ap);
+    if (state == s->state && wcscmp(text, s->status) == 0) return;
+    wcscpy_s(s->status, ARRAYSIZE(s->status), text);
+    s->state = state;
+    /* The log gets each status once. Gray ones are left out (VM start and stop are logged
+       already), and so is the short check that alternates with "waiting for Sunshine" at boot. */
+    if (state == VM_STREAM_OFF) {
+        s->logged[0] = L'\0';
+    } else if (wcscmp(text, L"checking the pairing") != 0 && wcscmp(text, s->logged) != 0) {
+        wcscpy_s(s->logged, ARRAYSIZE(s->logged), text);
+        ui_log(L"Moonlight: \"%s\": %s.", s->name, text);
+    }
+    if (g_on_changed) g_on_changed(s->vm_id, FALSE);
+}
+
+/* State while not ready: yellow, orange once it is recovering, red after repeated failures (in the
+   background) or once a waiting open gave up. */
+static VmStreamState unready_state(const StreamSlot *s)
+{
+    if (s->open_gave_up) return VM_STREAM_FAILED;
+    if (!s->want_open && s->pair_failures >= PAIR_FAILS_ATTENTION) return VM_STREAM_FAILED;
+    if (s->force_pair || s->pair_failures) return VM_STREAM_HEALING;
+    return VM_STREAM_PAIRING;
+}
+
+/* Begin waiting to open: Moonlight launches once the VM is ready (caller holds g_lock). */
+static void want_open(StreamSlot *s)
+{
+    s->want_open = TRUE;
+    s->want_until = 0;
+    s->open_gave_up = FALSE;
+    s->next_check = 0;   /* check now, not after a background backoff */
 }
 
 /* Run a command hidden and wait for it. cmd must be writable. Returns its exit code. */
@@ -760,15 +803,16 @@ static BOOL launch_stream(StreamSlot *s, VmInstance *vm)
                bitrate_kbps(vm));
     s->moonlight = start_moonlight(args);
     if (!s->moonlight) {
-        set_status(s, L"Moonlight could not be started (see the App Sandbox log)");
+        set_status(s, VM_STREAM_FAILED, L"Moonlight could not be started (see the App Sandbox log)");
         return FALSE;
     }
     s->launched = GetTickCount64();
     GetSystemTimeAsFileTime(&s->launched_ft);
     s->watching = TRUE;
-    set_status(s, L"starting the stream");
-    ui_log(L"Moonlight: streaming \"%s\" at %lux%lu@%lu, %lu kbps.", vm->name,
-           vm->display_width, vm->display_height, vm->display_refresh, bitrate_kbps(vm));
+    set_status(s, s->relaunches ? VM_STREAM_HEALING : VM_STREAM_READY,
+               L"starting the stream at %lux%lu@%lu, %lu kbps", vm->display_width, vm->display_height,
+               vm->display_refresh, bitrate_kbps(vm));
+    if (g_on_changed) g_on_changed(s->vm_id, TRUE);
     return TRUE;
 }
 
@@ -785,14 +829,12 @@ static void stream_failed(StreamSlot *s, const wchar_t *why)
     wcsncpy_s(s->last_error, ARRAYSIZE(s->last_error), why, _TRUNCATE);
     if (s->relaunches < STREAM_RELAUNCHES) {
         s->relaunches++;
-        s->relaunch = TRUE;
-        set_status(s, L"the stream failed (%s); pairing again and retrying", why);
-        ui_log(L"Moonlight: the stream for \"%s\" failed: %s. Pairing again, then relaunching.", s->name, why);
+        want_open(s);
+        set_status(s, VM_STREAM_HEALING, L"the stream failed (%s); pairing again and retrying", why);
     } else {
-        s->relaunch = FALSE;
-        set_status(s, L"Moonlight could not stream: %s. The raw viewer still works; details in the App Sandbox log", why);
-        ui_log(L"Moonlight: the stream for \"%s\" failed again: %s. Not retrying; open it again to retry.",
-               s->name, why);
+        s->want_open = FALSE;
+        set_status(s, VM_STREAM_FAILED, L"Moonlight could not stream: %s. Not retrying; open the native "
+                   L"display again to retry. The raw viewer still works", why);
     }
 }
 
@@ -829,7 +871,7 @@ static DWORD WINAPI monitor_thread(LPVOID param)
                     swprintf_s(why, ARRAYSIZE(why), L"Moonlight exited (code %ld) before the video started", (long)code);
                     stream_failed(s, why);
                 } else if (s->ready) {
-                    set_status(s, L"ready");
+                    set_status(s, VM_STREAM_READY, L"ready");
                 }
             } else if (s->moonlight && s->watching) {
                 int verdict = stream_log_verdict(s, why, ARRAYSIZE(why));
@@ -837,8 +879,7 @@ static DWORD WINAPI monitor_thread(LPVOID param)
                     s->watching = FALSE;
                     s->relaunches = 0;
                     s->last_error[0] = L'\0';
-                    set_status(s, L"streaming");
-                    ui_log(L"Moonlight: \"%s\" video started.", v->name);
+                    set_status(s, VM_STREAM_READY, L"streaming");
                 } else if (verdict < 0) {
                     stream_failed(s, why);
                 } else if (now - s->launched >= STREAM_START_MS) {
@@ -850,19 +891,35 @@ static DWORD WINAPI monitor_thread(LPVOID param)
                 if (s->moonlight) ui_log(L"Moonlight: \"%s\" is stopping, closing the stream.", v->name);
                 close_slot(s);
                 s->watching = FALSE;
-                s->relaunch = FALSE;
+                s->want_open = FALSE;
+                s->open_gave_up = FALSE;
                 s->ready = FALSE;
                 s->next_check = 0;
                 s->pair_wait = 0;
-                set_status(s, L"the VM is not running");
+                s->pair_failures = 0;
+                set_status(s, VM_STREAM_OFF, L"the VM is not running");
                 continue;
             }
-            if (s->ready && s->relaunch && !s->moonlight) {
-                s->relaunch = FALSE;
-                ui_log(L"Moonlight: relaunching the stream for \"%s\".", v->name);
+            if (s->ready && s->want_open && !s->moonlight) {
+                s->want_open = FALSE;
                 launch_stream(s, v);
             }
-            if (!g_installed) set_status(s, L"installing Moonlight");
+            if (s->want_open && s->want_until && now >= s->want_until && !s->ready) {
+                /* Failed pairings for OPEN_RETRY_FOR_MS while an open was waiting: stop waiting. */
+                s->want_open = FALSE;
+                s->open_gave_up = TRUE;
+                s->pair_wait = PAIR_RETRY_MS;
+                s->next_check = now + PAIR_RETRY_MS;
+                set_status(s, VM_STREAM_FAILED, L"pairing kept failing for %d s, so the native display was not "
+                           L"opened; still retrying in the background. Open it again to retry now (details in "
+                           L"the App Sandbox log)", OPEN_RETRY_FOR_MS / 1000);
+            }
+            if (!s->ready && !v->agent_online)
+                set_status(s, VM_STREAM_OFF, L"waiting for the VM to start");
+            else if (!g_installed && g_install_failed)
+                set_status(s, VM_STREAM_HEALING, L"installing Moonlight failed; retrying (details in the App Sandbox log)");
+            else if (!g_installed)
+                set_status(s, VM_STREAM_PAIRING, L"installing Moonlight");
             if (!have_pending && !s->ready && v->agent_online && g_installed && now >= s->next_check) {
                 target_from(v, &pending);
                 pending.force = s->force_pair;
@@ -886,6 +943,7 @@ static DWORD WINAPI monitor_thread(LPVOID param)
 
         if (any_native && !g_installed && now >= next_install) {
             g_installed = moonlight_installed() || install_moonlight();
+            g_install_failed = !g_installed;
             if (!g_installed) {
                 ui_log(L"Moonlight: install failed, retrying in %llu s.", install_wait / 1000);
                 next_install = now + install_wait;
@@ -898,7 +956,7 @@ static DWORD WINAPI monitor_thread(LPVOID param)
             EnterCriticalSection(&g_lock);
             {
                 StreamSlot *s = slot_find(pending.vm_id, FALSE);
-                if (s) set_status(s, pending.force ? L"pairing again" : L"checking the pairing");
+                if (s) set_status(s, unready_state(s), pending.force ? L"pairing again" : L"checking the pairing");
             }
             LeaveCriticalSection(&g_lock);
             result = prepare(&pending);
@@ -911,30 +969,42 @@ static DWORD WINAPI monitor_thread(LPVOID param)
                     s->ready = TRUE;
                     s->force_pair = FALSE;
                     s->pair_wait = 0;
-                    if (s->last_error[0] && !s->relaunch)
-                        set_status(s, L"ready; the last stream failed (%s). The raw viewer still works; "
-                                      L"details in the App Sandbox log", s->last_error);
+                    s->pair_failures = 0;
+                    s->open_gave_up = FALSE;
+                    s->want_until = 0;
+                    if (s->last_error[0] && !s->want_open)
+                        set_status(s, VM_STREAM_FAILED, L"paired, but the last stream failed (%s). Open the "
+                                   L"native display again to retry; the raw viewer still works", s->last_error);
                     else
-                        set_status(s, L"ready");
+                        set_status(s, s->relaunches ? VM_STREAM_HEALING : VM_STREAM_READY,
+                                   s->want_open ? L"ready; opening" : L"ready");
                 } else if (s && result == PREP_NOT_UP) {
-                    set_status(s, L"waiting for Sunshine in the guest (installed on first boot, started at sign-in)");
+                    set_status(s, unready_state(s), L"waiting for Sunshine to start in the guest (it starts at sign-in)");
                 } else if (s && result == PREP_NO_DISPLAY) {
                     /* Not a pairing failure: no backoff, try again soon after a display is back. */
                     s->next_check = GetTickCount64() + NO_DISPLAY_RETRY_MS;
-                    set_status(s, L"waiting: %s", NO_DISPLAY_WHY);
+                    set_status(s, unready_state(s), L"waiting: %s", NO_DISPLAY_WHY);
+                } else if (s && result == PREP_FAILED && s->want_open) {
+                    /* Someone is waiting for the window: retry soon, for up to OPEN_RETRY_FOR_MS. */
+                    s->pair_failures++;
+                    if (!s->want_until) s->want_until = GetTickCount64() + OPEN_RETRY_FOR_MS;
+                    s->next_check = GetTickCount64() + OPEN_RETRY_MS;
+                    set_status(s, VM_STREAM_HEALING, L"pairing failed; retrying in %d s, then opening (details "
+                               L"in the App Sandbox log)", OPEN_RETRY_MS / 1000);
                 } else if (s && result == PREP_FAILED) {
+                    s->pair_failures++;
                     s->pair_wait = s->pair_wait ? min(s->pair_wait * 2, PAIR_RETRY_MAX_MS) : PAIR_RETRY_MS;
                     s->next_check = GetTickCount64() + s->pair_wait;
-                    set_status(s, L"pairing failed; retrying in %llu s (details in the App Sandbox log)",
-                               s->pair_wait / 1000);
-                    ui_log(L"Moonlight: retrying \"%s\" in %llu s.", pending.name, s->pair_wait / 1000);
+                    if (s->pair_failures >= PAIR_FAILS_ATTENTION)
+                        set_status(s, VM_STREAM_FAILED, L"pairing failed %d times in a row; still retrying, "
+                                   L"next in %llu s (details in the App Sandbox log)",
+                                   s->pair_failures, s->pair_wait / 1000);
+                    else
+                        set_status(s, VM_STREAM_HEALING, L"pairing failed; retrying in %llu s (details in the "
+                                   L"App Sandbox log)", s->pair_wait / 1000);
                 }
             }
             LeaveCriticalSection(&g_lock);
-            if (result == PREP_READY) {
-                ui_log(L"Moonlight: \"%s\" is ready to stream.", pending.name);
-                if (g_on_ready) g_on_ready(pending.vm_id);
-            }
         }
 
         for (i = 0; i < 4 && g_running; i++) Sleep(500);
@@ -944,11 +1014,11 @@ static DWORD WINAPI monitor_thread(LPVOID param)
 
 /* ---- public ---- */
 
-void vm_stream_init(VmStreamReadyFn on_ready)
+void vm_stream_init(VmStreamChangedFn on_changed)
 {
     if (g_thread) return;
     InitializeCriticalSection(&g_lock);
-    g_on_ready = on_ready;
+    g_on_changed = on_changed;
     if (!GetEnvironmentVariableW(L"ProgramData", g_base, MAX_PATH))
         wcscpy_s(g_base, MAX_PATH, L"C:\\ProgramData");
     wcscat_s(g_base, MAX_PATH, L"\\AppSandbox");
@@ -996,28 +1066,47 @@ static BOOL CALLBACK focus_window(HWND hwnd, LPARAM pid)
     return TRUE;
 }
 
-BOOL vm_stream_open(VmInstance *vm)
+VmStreamOpen vm_stream_open(VmInstance *vm, BOOL queue)
 {
     StreamSlot *s;
-    BOOL ok = FALSE;
-    if (!vm || !vm->native_display || !g_installed) return FALSE;
+    VmStreamOpen r = VM_STREAM_NOT_OPENED;
+    if (!vm || !vm->native_display || !g_thread) return r;
     EnterCriticalSection(&g_lock);
-    s = slot_find(vm->unique_id, FALSE);
-    if (s && s->ready) {
+    s = slot_find(vm->unique_id, TRUE);
+    if (s) s->relaunches = 0;   /* an open by the user gets a fresh automatic retry */
+    if (s && s->ready && g_installed) {
         if (s->moonlight && WaitForSingleObject(s->moonlight, 0) == WAIT_TIMEOUT) {
             EnumWindows(focus_window, (LPARAM)GetProcessId(s->moonlight));
-            ok = TRUE;
+            r = VM_STREAM_OPENED;
         } else {
             if (s->moonlight) { CloseHandle(s->moonlight); s->moonlight = NULL; }
-            s->relaunches = 0;   /* an open by the user gets a fresh automatic retry */
-            s->relaunch = FALSE;
-            ok = launch_stream(s, vm);
+            s->want_open = FALSE;
+            if (launch_stream(s, vm)) r = VM_STREAM_OPENED;
         }
+    } else if (s && queue) {
+        want_open(s);
+        ui_log(L"Moonlight: \"%s\": the native display opens when it is ready.", vm->name);
+        if (s->state == VM_STREAM_FAILED)
+            set_status(s, unready_state(s), L"%s", s->status);   /* a gave-up red: waiting again */
+        r = VM_STREAM_QUEUED;
     } else if (s) {
-        s->next_check = 0;   /* not ready: the user is waiting, so check again now, not after the backoff */
+        s->next_check = 0;   /* not ready: the caller is waiting, so check again now, not after the backoff */
     }
     LeaveCriticalSection(&g_lock);
-    return ok;
+    return r;
+}
+
+void vm_stream_cancel_open(UINT64 vm_id)
+{
+    StreamSlot *s;
+    if (!g_thread) return;
+    EnterCriticalSection(&g_lock);
+    s = slot_find(vm_id, FALSE);
+    if (s && s->want_open && !s->moonlight) {
+        s->want_open = FALSE;
+        ui_log(L"Moonlight: \"%s\": the queued native display open is cancelled.", s->name);
+    }
+    LeaveCriticalSection(&g_lock);
 }
 
 BOOL vm_stream_is_open(UINT64 vm_id)
@@ -1051,22 +1140,32 @@ void vm_stream_close(UINT64 vm_id)
     EnterCriticalSection(&g_lock);
     s = slot_find(vm_id, FALSE);
     if (s) {
-        close_slot(s);
+        close_slot(s);   /* a queued open stays: only vm_stream_cancel_open drops it */
         s->watching = FALSE;
-        s->relaunch = FALSE;
-        if (s->ready) set_status(s, L"ready");
+        if (s->ready) set_status(s, VM_STREAM_READY, L"ready");
     }
     LeaveCriticalSection(&g_lock);
 }
 
-void vm_stream_status(UINT64 vm_id, wchar_t *out, size_t cch)
+VmStreamState vm_stream_status(UINT64 vm_id, wchar_t *out, size_t cch)
 {
     StreamSlot *s;
-    if (!out || !cch) return;
+    VmStreamState state = VM_STREAM_OFF;
+    if (!out || !cch) return state;
     out[0] = L'\0';
-    if (!g_thread) return;
+    if (!g_thread) return state;
     EnterCriticalSection(&g_lock);
     s = slot_find(vm_id, FALSE);
-    if (s) wcscpy_s(out, cch, s->status);
+    if (s) {
+        wcscpy_s(out, cch, s->status);
+        state = s->state;
+    }
     LeaveCriticalSection(&g_lock);
+    return state;
+}
+
+const char *vm_stream_state_name(VmStreamState state)
+{
+    static const char *names[] = { "off", "pairing", "ready", "healing", "failed" };
+    return (unsigned)state < ARRAYSIZE(names) ? names[state] : "off";
 }

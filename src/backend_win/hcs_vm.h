@@ -48,6 +48,7 @@ typedef struct {
     BOOL    test_mode;               /* TRUE = disable Secure Boot (for test-signed drivers) */
     BOOL    ssh_enabled;             /* TRUE = install OpenSSH Server in guest */
     BOOL    ssh_deploy_key;          /* TRUE = deploy the AppSandbox public key (needs ssh_enabled) */
+    BOOL    auto_start;              /* TRUE = start when App Sandbox opens (see asb_vm_should_auto_start) */
     BOOL    native_display;          /* TRUE = VDD at display_* + Sunshine in the guest (see asb_core.h) */
     DWORD   display_width, display_height, display_refresh;
     DWORD   display_width_mm, display_height_mm;   /* host monitor's physical size; 0 = unknown */
@@ -117,6 +118,7 @@ typedef struct {
     BOOL        ssh_deploy_key;          /* TRUE = deploy the AppSandbox public key to the guest */
     volatile BOOL ssh_key_deployed;      /* TRUE once the guest agent has written authorized_keys */
     wchar_t     ssh_pubkey[512];         /* AppSandbox public-key line to deploy (ed25519) */
+    BOOL        auto_start;              /* TRUE = start when App Sandbox opens */
     BOOL        native_display;          /* TRUE = streamed native-resolution display (see VmConfig) */
     DWORD       display_width, display_height, display_refresh;
     DWORD       display_width_mm, display_height_mm;

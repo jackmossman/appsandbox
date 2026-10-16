@@ -45,6 +45,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
         }
     }
 
+    /* --tray (start at login): start in the system tray, without showing the window. */
+    if (pCmdLine && wcsstr(pCmdLine, L"--tray")) nCmdShow = SW_HIDE;
+
     /* Create main window */
     hwnd = ui_create_main_window(hInstance, nCmdShow);
     if (!hwnd) {

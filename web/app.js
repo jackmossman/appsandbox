@@ -656,6 +656,7 @@ function gatherConfig() {
         testMode:    document.getElementById('test-mode').checked,
         sshEnabled:  document.getElementById('ssh-enabled').checked,
         sshDeployKey: document.getElementById('ssh-deploy-key').checked,
+        autoStart:   !hostBridge.isMac && document.getElementById('auto-start').checked,
         nativeDisplay: nativeDisplayOn(),
         displayWidth:   nativeDisplayOn() ? document.getElementById('display-width').valueAsNumber : 0,
         displayHeight:  nativeDisplayOn() ? document.getElementById('display-height').valueAsNumber : 0,
@@ -1062,6 +1063,20 @@ function buildRowCells(vm, i, statusTd) {
                 ? 'In-VM agent is connected — host can manage the guest'
                 : 'In-VM agent is not connected'));
 
+    /* Native display VMs: a dot for the stream's state (gray, yellow, green, orange, red). */
+    var nativeTd = document.createElement('td');
+    if (vm.nativeDisplay) {
+        var ns = vm.running ? (vm.streamState || 0) : 0;
+        nativeTd.innerHTML = '<span class="agent-dot native-dot s' + ns + '"></span>';
+        nativeTd.title = [
+            'Native display: the VM is stopped or still starting',
+            'Native display: the VM is up; Moonlight is being set up and paired',
+            'Native display: ready to stream',
+            'Native display: recovering by itself (pairing again or retrying)',
+            'Native display: failed and needs attention; details in the log'
+        ][ns] || '';
+    }
+
     var bld = vm.buildingVhdx;
 
     var sshActive = vm.sshEnabled && (vm.sshState === 2 || vm.sshState === 4) && vm.running && !bld;
@@ -1080,6 +1095,9 @@ function buildRowCells(vm, i, statusTd) {
         makeCell(vm.osType),
         statusTd,
         agentTd,
+    ];
+    if (!hostBridge.isMac) cells.push(nativeTd);
+    cells.push(
         makeCell(vm.cpuCores, 'Number of virtual CPU cores assigned to this VM'),
         makeCell(vm.ramMb + ' MB', 'Memory allocated to this VM, in megabytes'),
         makeCell(vm.hddGb + ' GB', 'Virtual disk size, in gigabytes'),
@@ -1091,7 +1109,7 @@ function buildRowCells(vm, i, statusTd) {
             hostBridge.isMac ? 'NAT (shared networking)'
                 : 'Networking mode: NAT (shared), External (bridged), Internal (host-only), or None'
                   + (vm.natIp ? '\nNAT address: ' + vm.natIp : '') + (vm.mac ? '\nMAC: ' + vm.mac : '')),
-    ];
+    );
     if (!hostBridge.isMac) cells.push(makeSnapCell(vm, i));
     cells.push(
         makeIconCell('start', '\u25B6\uFE0F', !vm.running && !bld, function() { onStartVm(i); }, '', 'Start the VM (boots from the selected snapshot/branch)'),
@@ -1101,7 +1119,6 @@ function buildRowCells(vm, i, statusTd) {
         makeIconCell('open-native', '\uD83D\uDDA5\uFE0F', vm.running && !bld && !!vm.nativeDisplay,
             function() { sendCmd('openNativeVm', {vmIndex: i}); }, '',
             vm.nativeDisplay ? 'Open the native display full screen (Moonlight, ' + (vm.displayMode || 'native') + ')'
-                               + (vm.streamStatus ? '\nMoonlight: ' + vm.streamStatus : '')
                              : 'Native display is off for this VM (a create-time option)'),
         sshCell,
         makeIconCell('shutdown', '\u23FB', vm.running && !bld, function() { sendCmd('shutdownVm', {vmIndex: i}); }, '', 'Request a graceful shutdown from the guest OS'),
@@ -1123,7 +1140,7 @@ function renderVmTable() {
         tbody.innerHTML = '';
         var tr = document.createElement('tr');
         var td = document.createElement('td');
-        td.colSpan = hostBridge.isMac ? 16 : 17;
+        td.colSpan = hostBridge.isMac ? 16 : 18;
         td.className = 'empty-state';
         var btn = document.createElement('button');
         btn.className = 'primary empty-state-btn';
@@ -1175,7 +1192,7 @@ function renderVmTable() {
             vm.sshEnabled, vm.sshState, vm.sshPort,
             vm.osType, vm.ramMb, vm.hddGb, vm.cpuCores,
             vm.gpuMode, vm.gpuId, vm.gpuName, vm.networkMode, vm.natIp, vm.mac,
-            vm.nativeDisplay, vm.displayMode, vm.streamStatus,
+            vm.nativeDisplay, vm.displayMode, vm.streamState,
             selectedSnap.get(vm.name) || 'current',
             /* Snapshot tree: take/delete/rename/branch must trigger a row rebuild
                so makeSnapCell re-runs. These fields only change on user snapshot
@@ -1270,6 +1287,7 @@ function openEditVmModal(idx) {
     document.getElementById('edit-cpu-cores').value = vm.cpuCores;
     setGpuSelection('edit-gpu-mode', vm);
     document.getElementById('edit-net-mode').value = String(vm.networkMode);
+    document.getElementById('edit-auto-start').checked = !!vm.autoStart;
     updateEditVmModal();
     document.getElementById('edit-vm-overlay').classList.add('active');
     document.getElementById('edit-ram-size').focus();
@@ -1300,6 +1318,7 @@ function editVmValues() {
     if (!hostBridge.isMac) {
         Object.assign(values, selectedGpu('edit-gpu-mode'));
         values.networkMode = Number(document.getElementById('edit-net-mode').value);
+        values.autoStart = document.getElementById('edit-auto-start').checked;
     }
     return values;
 }

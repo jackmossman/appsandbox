@@ -822,6 +822,8 @@ static void save_vm_list(void)
             fwprintf(f, L"SshPubKey=%s\n", g_vms[i].ssh_pubkey);
         if (g_vms[i].install_complete)
             fwprintf(f, L"InstallComplete=1\n");
+        if (g_vms[i].auto_start)
+            fwprintf(f, L"AutoStart=1\n");
         if (g_vms[i].native_display) {
             fwprintf(f, L"NativeDisplay=1\n");
             fwprintf(f, L"DisplayMode=%lux%lu@%lu\n", g_vms[i].display_width,
@@ -1001,6 +1003,8 @@ static void load_vm_list(void)
             vm->install_complete = (_wtoi(line + 16) != 0);
         else if (wcsncmp(line, L"NativeDisplay=", 14) == 0)
             vm->native_display = (_wtoi(line + 14) != 0);
+        else if (wcsncmp(line, L"AutoStart=", 10) == 0)
+            vm->auto_start = (_wtoi(line + 10) != 0);
         else if (wcsncmp(line, L"DisplayMode=", 12) == 0) {
             if (swscanf_s(line + 12, L"%lux%lu@%lu", &vm->display_width, &vm->display_height,
                           &vm->display_refresh) != 3)
@@ -3474,6 +3478,7 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
     cfg.network_mode = config->network_mode;
     cfg.test_mode = config->test_mode;
     cfg.ssh_enabled = config->ssh_enabled;
+    cfg.auto_start = config->auto_start && !config->is_template;
     /* Key deploy needs SSH; prepare the AppSandbox keypair now so the build path
        stores the public key on the instance (the agent deploys it at runtime). */
     cfg.ssh_deploy_key = config->ssh_deploy_key && config->ssh_enabled;
@@ -3680,6 +3685,7 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
             inst->test_mode = cfg.test_mode;
             wcscpy_s(inst->admin_user, 128, cfg.admin_user);
             inst->ssh_enabled = cfg.ssh_enabled;
+            inst->auto_start = cfg.auto_start;
             inst->ssh_deploy_key = cfg.ssh_deploy_key;
             if (cfg.ssh_deploy_key) wcscpy_s(inst->ssh_pubkey, 512, ssh_pubkey);
             copy_native_display(inst, &cfg);
@@ -3752,6 +3758,7 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
             inst->test_mode = cfg.test_mode;
             wcscpy_s(inst->admin_user, 128, cfg.admin_user);
             inst->ssh_enabled = cfg.ssh_enabled;
+            inst->auto_start = cfg.auto_start;
             inst->ssh_deploy_key = cfg.ssh_deploy_key;
             if (cfg.ssh_deploy_key) wcscpy_s(inst->ssh_pubkey, 512, ssh_pubkey);
             inst->building_vhdx = TRUE;
@@ -3950,6 +3957,7 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
        paths set them inline on their own instance copies). */
     inst->ssh_deploy_key = cfg.ssh_deploy_key;
     if (cfg.ssh_deploy_key) wcscpy_s(inst->ssh_pubkey, 512, ssh_pubkey);
+    inst->auto_start = cfg.auto_start;
     copy_native_display(inst, &cfg);
     SecureZeroMemory(cfg.stream_password, sizeof(cfg.stream_password));
 
@@ -4429,6 +4437,26 @@ ASB_API HRESULT asb_vm_set_network(AsbVm vm, int mode)
     save_vm_list();
     if (g_state_cb) g_state_cb(vm, g_vms[idx].running, g_state_ud);
     return S_OK;
+}
+
+ASB_API HRESULT asb_vm_set_auto_start(AsbVm vm, BOOL on)
+{
+    int idx = vm_index_of(vm);
+    if (idx < 0) return E_INVALIDARG;
+    if (g_vms[idx].running) return E_ACCESSDENIED;
+    if (g_vms[idx].is_template && on) return E_INVALIDARG;
+    g_vms[idx].auto_start = on;
+    save_vm_list();
+    if (g_state_cb) g_state_cb(vm, g_vms[idx].running, g_state_ud);
+    return S_OK;
+}
+
+ASB_API BOOL asb_vm_should_auto_start(AsbVm vm)
+{
+    int idx = vm_index_of(vm);
+    if (idx < 0) return FALSE;
+    return g_vms[idx].auto_start && !g_vms[idx].running && !g_vms[idx].is_template &&
+           !g_vms[idx].building_vhdx && g_vms[idx].install_complete;
 }
 
 /* ---- Snapshots ---- */

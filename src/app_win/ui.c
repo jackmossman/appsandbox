@@ -64,13 +64,20 @@ static VmDisplayIdd *g_idd_displays[ASB_MAX_VMS];
 #define WM_VM_SHUTDOWN_TIMEOUT (WM_APP + 9)
 #define WM_PREREQ_DONE        (WM_APP + 17)
 #define WM_DISK_SPACE         (WM_APP + 19)
+#define WM_VM_STREAM_CHANGED  (WM_APP + 20)
+
+#define TIMER_AUTOSTART       41
+#define AUTOSTART_GAP_MS      10000   /* between VMs that start with App Sandbox: they share the
+                                         GPU and the disk while they boot */
 
 /* Tray */
 #define TRAY_CMD_SHOW          1
 #define TRAY_CMD_EXIT          2
+#define TRAY_CMD_START_AT_LOGIN 3
 #define TRAY_CMD_CONNECT_BASE  100
 #define TRAY_CMD_SHUTDOWN_BASE 200
 #define TRAY_CMD_STOP_BASE     300
+#define TRAY_CMD_NATIVE_BASE   400
 
 static NOTIFYICONDATAW g_nid;
 
@@ -104,6 +111,39 @@ static void send_vm_list(void);
 static void send_full_state(void);
 static void send_adapters(void);
 static void send_templates(void);
+
+/* VMs set to start with App Sandbox: one now, the next AUTOSTART_GAP_MS later (TIMER_AUTOSTART). */
+static int  g_autostart_next = -1;    /* next VM index to consider; -1 = not begun */
+
+static void autostart_begin(void)
+{
+    if (g_autostart_next >= 0) return;   /* once per run */
+    g_autostart_next = 0;
+    SetTimer(g_hwnd_main, TIMER_AUTOSTART, 1000, NULL);
+}
+
+static void autostart_tick(void)
+{
+    int count = asb_vm_count();
+    KillTimer(g_hwnd_main, TIMER_AUTOSTART);
+    for (; g_autostart_next < count; g_autostart_next++) {
+        AsbVm vm = asb_vm_get(g_autostart_next);
+        VmInstance *v = asb_vm_instance(vm);
+        if (!asb_vm_should_auto_start(vm)) continue;
+        ui_log(L"Starting \"%s\" (Start on Open).", v ? v->name : L"?");
+        asb_vm_start(vm, -1, -1, NULL);
+        send_vm_list();
+        g_autostart_next++;
+        SetTimer(g_hwnd_main, TIMER_AUTOSTART, AUTOSTART_GAP_MS, NULL);
+        return;
+    }
+}
+
+/* vm_stream's threads -> UI thread. */
+static void on_stream_changed(UINT64 vm_id, BOOL launched)
+{
+    PostMessageW(g_hwnd_main, WM_VM_STREAM_CHANGED, (WPARAM)launched, (LPARAM)vm_id);
+}
 
 /* ---- Safe display teardown ---- */
 
@@ -346,13 +386,14 @@ static void build_vm_json(JsonBuilder *jb, int i)
         jb_string(jb, L"natIp", ip);
         jb_string(jb, L"mac", v->mac_address);
     }
+    jb_bool(jb, L"autoStart", v->auto_start);
     jb_bool(jb, L"nativeDisplay", v->native_display);
     if (v->native_display) {
         wchar_t mode[48], status[200];
         swprintf_s(mode, ARRAYSIZE(mode), L"%lux%lu@%lu", v->display_width, v->display_height,
                    v->display_refresh);
         jb_string(jb, L"displayMode", mode);
-        vm_stream_status(v->unique_id, status, ARRAYSIZE(status));
+        jb_int(jb, L"streamState", (int)vm_stream_status(v->unique_id, status, ARRAYSIZE(status)));
         jb_string(jb, L"streamStatus", status);
     }
 
@@ -747,7 +788,20 @@ static void do_connect_vm(int idx)
        for the RDP-over-named-pipe pattern but are no longer invoked.
        The g_displays[]/safe_destroy_rdp cleanup paths remain inert
        because nothing populates the slots. */
+    VmInstance *v = (idx >= 0 && idx < asb_vm_count()) ? asb_vm_instance(asb_vm_get(idx)) : NULL;
+    if (v) vm_stream_cancel_open(v->unique_id);   /* the user chose the raw viewer */
     do_connect_idd(idx);
+}
+
+/* Native display VMs: Moonlight full screen at the native mode, replacing the raw viewer; until it
+   is ready the open is queued and Moonlight opens by itself (the log says so). */
+static void do_open_native(int idx)
+{
+    VmInstance *v;
+    if (idx < 0 || idx >= asb_vm_count()) return;
+    v = asb_vm_instance(asb_vm_get(idx));
+    if (v && v->running && v->native_display && vm_stream_open(v, TRUE) == VM_STREAM_OPENED)
+        safe_destroy_idd(idx);
 }
 
 /* ---- System tray ---- */
@@ -789,6 +843,8 @@ typedef struct {
     BOOL    is_separator;
     BOOL    is_header;    /* dim label used as a section heading */
     BOOL    is_indented;  /* indent under a header */
+    BOOL    is_checkable; /* room for a check mark before the label */
+    BOOL    is_checked;
 } TrayDrawItem;
 
 static TrayDrawItem g_tray_items[64];
@@ -828,6 +884,16 @@ static void tray_append(HMENU menu, UINT id, const wchar_t *label,
     g_tray_item_count++;
 }
 
+static void tray_append_check(HMENU menu, UINT id, const wchar_t *label, BOOL checked)
+{
+    int n = g_tray_item_count;
+    tray_append(menu, id, label, FALSE, FALSE, FALSE);
+    if (g_tray_item_count > n) {
+        g_tray_items[n].is_checkable = TRUE;
+        g_tray_items[n].is_checked   = checked;
+    }
+}
+
 static void tray_handle_measure(MEASUREITEMSTRUCT *mis)
 {
     TrayDrawItem *it;
@@ -852,7 +918,7 @@ static void tray_handle_measure(MEASUREITEMSTRUCT *mis)
     ReleaseDC(NULL, hdc);
 
     mis->itemHeight = sz.cy + (it->is_header ? 6 : 10);
-    mis->itemWidth  = sz.cx + (it->is_indented ? 40 : 28);
+    mis->itemWidth  = sz.cx + (it->is_indented ? 40 : 28) + (it->is_checkable ? 20 : 0);
 }
 
 static void tray_handle_draw(DRAWITEMSTRUCT *dis)
@@ -904,6 +970,11 @@ static void tray_handle_draw(DRAWITEMSTRUCT *dis)
     indent = it->is_indented ? 28 : 14;
     rc.left += indent;
     rc.right -= 14;
+    if (it->is_checkable) {
+        if (it->is_checked)
+            DrawTextW(dis->hDC, L"\u2713", -1, &rc, DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX);
+        rc.left += 20;
+    }
     DrawTextW(dis->hDC, it->label, -1, &rc,
               DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX);
 
@@ -925,6 +996,100 @@ static LRESULT CALLBACK tray_menu_hook_proc(int code, WPARAM wp, LPARAM lp)
         }
     }
     return CallNextHookEx(NULL, code, wp, lp);
+}
+
+/* ---- Start at login ----
+ * A scheduled task, not a Run key: App Sandbox needs elevation, and Windows does not start
+ * elevated programs from the Run key. The task starts it in the tray at this user's sign-in. */
+
+#define LOGIN_TASK_NAME L"App Sandbox"
+
+static DWORD run_schtasks(const wchar_t *args)
+{
+    wchar_t cmd[1024];
+    STARTUPINFOW si = { sizeof(si) };
+    PROCESS_INFORMATION pi = { 0 };
+    DWORD code = (DWORD)-1;
+    swprintf_s(cmd, ARRAYSIZE(cmd), L"schtasks.exe %s", args);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    if (!CreateProcessW(NULL, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi))
+        return GetLastError();
+    if (WaitForSingleObject(pi.hProcess, 15000) == WAIT_OBJECT_0) GetExitCodeProcess(pi.hProcess, &code);
+    else TerminateProcess(pi.hProcess, 1);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return code;
+}
+
+static BOOL login_task_exists(void)
+{
+    return run_schtasks(L"/query /tn \"" LOGIN_TASK_NAME L"\"") == 0;
+}
+
+/* XML-escape s into out (paths and user names may hold '&'). */
+static void xml_escape(const wchar_t *s, wchar_t *out, size_t cch)
+{
+    size_t n = 0;
+    for (; *s && n + 6 < cch; s++) {
+        const wchar_t *rep = *s == L'&' ? L"&amp;" : *s == L'<' ? L"&lt;" : *s == L'>' ? L"&gt;" : NULL;
+        if (rep) { wcscpy_s(out + n, cch - n, rep); n += wcslen(rep); }
+        else out[n++] = *s;
+    }
+    out[n] = L'\0';
+}
+
+static BOOL login_task_set(BOOL on)
+{
+    wchar_t exe[MAX_PATH], dir[MAX_PATH], user[256], domain[128], name[128];
+    wchar_t exe_x[MAX_PATH * 2], dir_x[MAX_PATH * 2], user_x[512], xml_path[MAX_PATH], args[MAX_PATH + 64];
+    wchar_t xml[4096], *slash;
+    DWORD rc;
+    FILE *f;
+
+    if (!on) {
+        rc = run_schtasks(L"/delete /tn \"" LOGIN_TASK_NAME L"\" /f");
+        ui_log(L"Start at login: %s (schtasks exit %lu).", rc == 0 ? L"off" : L"could not remove the task", rc);
+        return rc == 0;
+    }
+    GetModuleFileNameW(NULL, exe, MAX_PATH);
+    wcscpy_s(dir, MAX_PATH, exe);
+    if ((slash = wcsrchr(dir, L'\\')) != NULL) *slash = L'\0';
+    if (!GetEnvironmentVariableW(L"USERDOMAIN", domain, ARRAYSIZE(domain))) domain[0] = L'\0';
+    if (!GetEnvironmentVariableW(L"USERNAME", name, ARRAYSIZE(name))) name[0] = L'\0';
+    swprintf_s(user, ARRAYSIZE(user), domain[0] ? L"%s\\%s" : L"%s%s", domain, name);
+    xml_escape(exe, exe_x, ARRAYSIZE(exe_x));
+    xml_escape(dir, dir_x, ARRAYSIZE(dir_x));
+    xml_escape(user, user_x, ARRAYSIZE(user_x));
+    /* No time limit (the default ends a task after 72 hours), runs on battery, normal priority. */
+    swprintf_s(xml, ARRAYSIZE(xml),
+        L"<?xml version=\"1.0\" encoding=\"UTF-16\"?>\r\n"
+        L"<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\r\n"
+        L"  <RegistrationInfo><Description>Starts App Sandbox in the system tray at sign-in.</Description></RegistrationInfo>\r\n"
+        L"  <Triggers><LogonTrigger><Enabled>true</Enabled><UserId>%s</UserId></LogonTrigger></Triggers>\r\n"
+        L"  <Principals><Principal id=\"Author\"><UserId>%s</UserId><LogonType>InteractiveToken</LogonType>"
+        L"<RunLevel>HighestAvailable</RunLevel></Principal></Principals>\r\n"
+        L"  <Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>"
+        L"<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>"
+        L"<ExecutionTimeLimit>PT0S</ExecutionTimeLimit><Priority>5</Priority></Settings>\r\n"
+        L"  <Actions Context=\"Author\"><Exec><Command>%s</Command><Arguments>--tray</Arguments>"
+        L"<WorkingDirectory>%s</WorkingDirectory></Exec></Actions>\r\n"
+        L"</Task>\r\n", user_x, user_x, exe_x, dir_x);
+    GetTempPathW(MAX_PATH, xml_path);
+    wcscat_s(xml_path, MAX_PATH, L"appsandbox-login-task.xml");
+    if (_wfopen_s(&f, xml_path, L"wb") != 0 || !f) {
+        ui_log(L"Start at login: cannot write %s.", xml_path);
+        return FALSE;
+    }
+    fwrite("\xFF\xFE", 1, 2, f);   /* UTF-16LE BOM */
+    fwrite(xml, sizeof(wchar_t), wcslen(xml), f);
+    fclose(f);
+    swprintf_s(args, ARRAYSIZE(args), L"/create /tn \"" LOGIN_TASK_NAME L"\" /xml \"%s\" /f", xml_path);
+    rc = run_schtasks(args);
+    DeleteFileW(xml_path);
+    if (rc == 0) ui_log(L"Start at login: on (scheduled task \"" LOGIN_TASK_NAME L"\" starts %s in the tray).", exe);
+    else         ui_log(L"Start at login: could not create the scheduled task (schtasks exit %lu).", rc);
+    return rc == 0;
 }
 
 static void tray_show_menu(HWND hwnd)
@@ -952,11 +1117,14 @@ static void tray_show_menu(HWND hwnd)
         if (!v || !v->running) continue;
         tray_append(menu, 0, v->name, FALSE, TRUE, FALSE);
         tray_append(menu, TRAY_CMD_CONNECT_BASE + i,  L"\U0001F4FA  Connect",    FALSE, FALSE, TRUE);
+        if (v->native_display)
+            tray_append(menu, TRAY_CMD_NATIVE_BASE + i, L"\U0001F5A5  Connect to native", FALSE, FALSE, TRUE);
         tray_append(menu, TRAY_CMD_SHUTDOWN_BASE + i, L"\u23FB  Shutdown",       FALSE, FALSE, TRUE);
         tray_append(menu, TRAY_CMD_STOP_BASE + i,     L"\u2715  Force Stop",     FALSE, FALSE, TRUE);
         tray_append(menu, 0, NULL, TRUE, FALSE, FALSE);
     }
 
+    tray_append_check(menu, TRAY_CMD_START_AT_LOGIN, L"Start at login", login_task_exists());
     tray_append(menu, TRAY_CMD_EXIT, L"Exit", FALSE, FALSE, FALSE);
 
     GetCursorPos(&pt);
@@ -973,6 +1141,10 @@ static void tray_show_menu(HWND hwnd)
         SetForegroundWindow(hwnd);
     } else if (cmd == TRAY_CMD_EXIT) {
         DestroyWindow(hwnd);
+    } else if (cmd == TRAY_CMD_START_AT_LOGIN) {
+        login_task_set(!login_task_exists());
+    } else if (cmd >= TRAY_CMD_NATIVE_BASE) {
+        do_open_native(cmd - TRAY_CMD_NATIVE_BASE);
     } else if (cmd >= TRAY_CMD_STOP_BASE) {
         int vi = cmd - TRAY_CMD_STOP_BASE;
         safe_destroy_rdp(vi);
@@ -1031,8 +1203,9 @@ static void on_webview2_message(const wchar_t *json)
         }
         g_prereq_ok = TRUE;
         asb_init();
-        vm_stream_init(NULL);
+        vm_stream_init(on_stream_changed);
         send_full_state();
+        autostart_begin();
     } else if (wcscmp(action, L"createVm") == 0) {
         if (!g_prereq_ok) {
             webview2_post(g_prereq_reboot_pending
@@ -1110,6 +1283,7 @@ static void on_webview2_message(const wchar_t *json)
         json_get_bool(json, L"sshEnabled", &cfg.ssh_enabled);
         json_get_bool(json, L"sshDeployKey", &cfg.ssh_deploy_key);
         json_get_bool(json, L"nativeDisplay", &cfg.native_display);
+        json_get_bool(json, L"autoStart", &cfg.auto_start);
         if (json_get_int(json, L"displayWidth", &val) && val > 0) cfg.display_width = (DWORD)val;
         if (json_get_int(json, L"displayHeight", &val) && val > 0) cfg.display_height = (DWORD)val;
         if (json_get_int(json, L"displayRefresh", &val) && val > 0) cfg.display_refresh = (DWORD)val;
@@ -1164,21 +1338,7 @@ static void on_webview2_message(const wchar_t *json)
     } else if (wcscmp(action, L"connectIddVm") == 0) {
         int idx; if (json_get_int(json, L"vmIndex", &idx)) do_connect_vm(idx);
     } else if (wcscmp(action, L"openNativeVm") == 0) {
-        /* Native display VMs: Moonlight full screen at the native mode, replacing the raw viewer. */
-        int idx;
-        if (json_get_int(json, L"vmIndex", &idx) && idx >= 0 && idx < asb_vm_count()) {
-            VmInstance *v = asb_vm_instance(asb_vm_get(idx));
-            if (v && v->running && v->native_display) {
-                if (vm_stream_open(v)) {
-                    safe_destroy_idd(idx);
-                } else {
-                    wchar_t msg[400];
-                    swprintf_s(msg, ARRAYSIZE(msg), L"Moonlight isn't ready for \"%s\" yet: it is still being "
-                               L"set up or paired, which takes about a minute after the VM signs in.", v->name);
-                    ui_show_alert(msg);
-                }
-            }
-        }
+        int idx; if (json_get_int(json, L"vmIndex", &idx)) do_open_native(idx);
     } else if (wcscmp(action, L"sshConnect") == 0) {
         int idx;
         if (json_get_int(json, L"vmIndex", &idx) && idx >= 0 && idx < asb_vm_count()) {
@@ -1287,6 +1447,7 @@ static void on_webview2_message(const wchar_t *json)
                     if (!error) hr = asb_vm_set_gpu_selection(vm, mode, gpu_id);
                 }
                 else if (wcscmp(field, L"networkMode") == 0) hr = asb_vm_set_network(vm, _wtoi(value));
+                else if (wcscmp(field, L"autoStart") == 0) hr = asb_vm_set_auto_start(vm, wcscmp(value, L"true") == 0);
                 if (FAILED(hr)) ui_show_alert(error ? error : L"VM configuration could not be updated.");
                 else asb_save();
             }
@@ -1530,6 +1691,10 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
 
     case WM_SIZE:
+        if (wp == SIZE_MINIMIZED) {
+            ShowWindow(hwnd, SW_HIDE);   /* minimized lives in the tray, not the taskbar */
+            return 0;
+        }
         webview2_resize(hwnd);
         return 0;
 
@@ -1571,6 +1736,21 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     }
 
+    case WM_TIMER:
+        if (wp == TIMER_AUTOSTART) { autostart_tick(); return 0; }
+        break;
+
+    case WM_VM_STREAM_CHANGED:
+        if (wp) {
+            /* Moonlight launched (a queued open, or a relaunch): one viewer at a time. */
+            VmInstance *inst = asb_find_vm_by_id((UINT64)lp);
+            int i, count = asb_vm_count();
+            for (i = 0; inst && i < count; i++)
+                if (asb_vm_instance(asb_vm_get(i)) == inst) { safe_destroy_idd(i); break; }
+        }
+        send_vm_list();   /* the Native column */
+        return 0;
+
     case WM_VM_REMOVED:
     {
         /* Library removed a VM at this index - compact display arrays */
@@ -1601,9 +1781,9 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                     ui_log(L"Agent online - switching \"%s\" from RDP to IDD.", inst->name);
                     safe_destroy_rdp(i);
                     do_connect_idd(i);
-                } else if (!g_idd_displays[i] && !inst->shutdown_requested) {
-                    do_connect_idd(i);
                 }
+                /* Starting a VM opens no viewer: the user opens the raw viewer or the native
+                   display when they want one. */
                 break;
             }
         }
@@ -1766,8 +1946,9 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             g_prereq_ok = TRUE;
             webview2_post(L"{\"type\":\"prereqResult\",\"ok\":true,\"reboot\":false}");
             asb_init();
-            vm_stream_init(NULL);
+            vm_stream_init(on_stream_changed);
             send_full_state();
+            autostart_begin();
         } else if (ok && reboot_required) {
             g_prereq_reboot_pending = TRUE;
             webview2_post(L"{\"type\":\"prereqResult\",\"ok\":true,\"reboot\":true}");

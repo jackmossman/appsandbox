@@ -203,6 +203,18 @@ static DWORD WINAPI bootstrap_thread(LPVOID p)
     asb_reconnect_running();
     vm_stream_init(NULL);   /* headless clients open the stream once GET .../display says streamReady */
     InterlockedExchange(&g_init_done, 1);
+    /* VMs set to start with App Sandbox, one after another: they share the GPU and the disk at boot. */
+    {
+        int i, started = 0;
+        for (i = 0; i < asb_vm_count(); i++) {
+            AsbVm vm = asb_vm_get(i);
+            VmInstance *v = asb_vm_instance(vm);
+            if (!asb_vm_should_auto_start(vm)) continue;
+            if (started++) Sleep(10000);
+            hlog(L"Starting \"%s\" (Start on Open).", v ? v->name : L"?");
+            asb_vm_start(vm, -1, -1, NULL);
+        }
+    }
     for (;;) Sleep(60000);   /* park; never exit */
 }
 
@@ -277,14 +289,15 @@ static int append_vm_json(char *out, int cap, int pos, VmInstance *v)
     /* NAT address (allocated at create, kept across restarts; "" when not NAT) and MAC. */
     pos += sprintf_s(out + pos, cap - pos, ",\"natIp\":\"%s\",\"mac\":", v->nat_ip);
     pos = append_wstr(out, cap, pos, v->mac_address);
+    pos += sprintf_s(out + pos, cap - pos, ",\"autoStart\":%s", v->auto_start ? "true" : "false");
     pos += sprintf_s(out + pos, cap - pos, ",\"nativeDisplay\":%s", v->native_display ? "true" : "false");
     if (v->native_display) {
         wchar_t status[200];
         pos += sprintf_s(out + pos, cap - pos, ",\"displayMode\":\"%lux%lu@%lu\"",
                          (unsigned long)v->display_width, (unsigned long)v->display_height,
                          (unsigned long)v->display_refresh);
-        vm_stream_status(v->unique_id, status, ARRAYSIZE(status));
-        pos += sprintf_s(out + pos, cap - pos, ",\"streamStatus\":");
+        pos += sprintf_s(out + pos, cap - pos, ",\"streamState\":\"%s\",\"streamStatus\":",
+                         vm_stream_state_name(vm_stream_status(v->unique_id, status, ARRAYSIZE(status))));
         pos = append_wstr(out, cap, pos, status);
     }
     pos += sprintf_s(out + pos, cap - pos, "}");
@@ -741,6 +754,7 @@ static int handle_request(PHTTP_REQUEST req)
             if (json_get_bool(body, L"sshEnabled", &bv)) cfg.ssh_enabled = bv;
             if (json_get_bool(body, L"sshDeployKey", &bv)) cfg.ssh_deploy_key = bv;
             if (json_get_bool(body, L"isTemplate", &bv)) cfg.is_template = bv;
+            if (json_get_bool(body, L"autoStart", &bv)) cfg.auto_start = bv;
             if (cfg.ssh_deploy_key && !cfg.ssh_enabled) {
                 send_err(req->RequestId, 400, "Bad Request", "invalid_arg",
                          "sshDeployKey requires sshEnabled");
@@ -880,6 +894,17 @@ static int handle_request(PHTTP_REQUEST req)
                              "Request body must contain valid UTF-8 JSON without NUL bytes.");
                     return 0;
                 }
+                {
+                    BOOL bv;
+                    if (json_get_bool(body, L"autoStart", &bv)) {
+                        hr = asb_vm_set_auto_start(vm, bv);
+                        if (FAILED(hr)) {
+                            send_err(req->RequestId, 400, "Bad Request", "invalid_arg",
+                                     "autoStart cannot be set on a template");
+                            return 0;
+                        }
+                    }
+                }
                 has_gpu = json_has_key(body, L"gpuMode") || json_has_key(body, L"gpuId");
                 if (has_gpu) {
                     const wchar_t *verr = read_gpu_selection(body, &gpu_mode,
@@ -955,6 +980,7 @@ static int handle_request(PHTTP_REQUEST req)
             }
             if (dv) {   /* close its display window / stream first */
                 display_drop(display_find(dv->unique_id));
+                vm_stream_cancel_open(dv->unique_id);
                 vm_stream_close(dv->unique_id);
             }
             send_hr(req->RequestId, "delete", nu, asb_vm_delete(vm));
@@ -1015,7 +1041,7 @@ static int handle_request(PHTTP_REQUEST req)
                                      "the VM was not created with the native display option");
                             return 0;
                         }
-                        if (!vm_stream_open(v)) {
+                        if (vm_stream_open(v, FALSE) != VM_STREAM_OPENED) {
                             send_err(req->RequestId, 409, "Conflict", "stream_not_ready",
                                      "Moonlight is not paired with the VM yet; retry when GET shows streamReady");
                             return 0;
@@ -1052,6 +1078,7 @@ static int handle_request(PHTTP_REQUEST req)
             }
             if (verb == HttpVerbDELETE) {
                 display_drop(display_find(v->unique_id));
+                vm_stream_cancel_open(v->unique_id);   /* a pending relaunch too */
                 vm_stream_close(v->unique_id);
                 send_json(req->RequestId, 200, "OK", "{\"ok\":true,\"displayOpen\":false}");
                 return 0;
@@ -1066,11 +1093,12 @@ static int handle_request(PHTTP_REQUEST req)
                 int n;
                 BOOL open = display_is_open(v->unique_id);
                 BOOL ready = open || asb_vm_idd_ready(vm);
-                n = sprintf_s(b, sizeof(b), "{\"open\":%s,\"ready\":%s,\"viewer\":\"%s\",\"streamReady\":%s,\"streamStatus\":",
+                VmStreamState state = vm_stream_status(v->unique_id, status, ARRAYSIZE(status));
+                n = sprintf_s(b, sizeof(b), "{\"open\":%s,\"ready\":%s,\"viewer\":\"%s\",\"streamReady\":%s,"
+                              "\"streamState\":\"%s\",\"streamStatus\":",
                               open ? "true" : "false", ready ? "true" : "false",
                               vm_stream_is_open(v->unique_id) ? "moonlight" : raw_display_is_open(v->unique_id) ? "raw" : "none",
-                              vm_stream_is_ready(v->unique_id) ? "true" : "false");
-                vm_stream_status(v->unique_id, status, ARRAYSIZE(status));
+                              vm_stream_is_ready(v->unique_id) ? "true" : "false", vm_stream_state_name(state));
                 n = append_wstr(b, (int)sizeof(b), n, status);
                 sprintf_s(b + n, sizeof(b) - n, "}");
                 send_json(req->RequestId, 200, "OK", b);

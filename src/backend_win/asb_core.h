@@ -69,6 +69,7 @@ typedef struct {
        configurable modes is test-signed). 0 x 0 @ 0 = the host's current display mode. */
     BOOL   native_display;
     DWORD  display_width, display_height, display_refresh;
+    BOOL   auto_start;             /* TRUE = start this VM when App Sandbox opens */
 } AsbVmConfig;
 
 /* The host's primary display: current mode, the monitor's physical size from its EDID
@@ -220,6 +221,13 @@ ASB_API HRESULT asb_vm_set_cpu(AsbVm vm, DWORD cores);
 ASB_API HRESULT asb_vm_set_gpu(AsbVm vm, int gpu_mode);
 ASB_API HRESULT asb_vm_set_gpu_selection(AsbVm vm, int gpu_mode, const wchar_t *gpu_id);
 ASB_API HRESULT asb_vm_set_network(AsbVm vm, int mode);
+
+/* Start this VM when App Sandbox (the window or the headless service) opens. VM must be stopped,
+   like every other setting. */
+ASB_API HRESULT asb_vm_set_auto_start(AsbVm vm, BOOL on);
+/* TRUE when vm is set to start with App Sandbox and can start now: stopped, not a template, not
+   building, and its OS install finished. Callers start such VMs one after another. */
+ASB_API BOOL    asb_vm_should_auto_start(AsbVm vm);
 
 /* ---- Snapshots ---- */
 
