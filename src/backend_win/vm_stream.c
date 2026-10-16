@@ -25,6 +25,7 @@
 #include <winsock2.h>
 #include <windows.h>
 #include <winhttp.h>
+#include <wtsapi32.h>
 #include <bcrypt.h>
 #include <share.h>
 #include <stdarg.h>
@@ -38,6 +39,7 @@
 
 #pragma comment(lib, "winhttp.lib")
 #pragma comment(lib, "bcrypt.lib")
+#pragma comment(lib, "wtsapi32.lib")
 
 #define MOONLIGHT_VERSION   "6.2.0"
 #define MOONLIGHT_HOST      L"github.com"
@@ -118,7 +120,7 @@ static void set_status(StreamSlot *s, const wchar_t *fmt, ...)   /* caller holds
 {
     va_list ap;
     va_start(ap, fmt);
-    vswprintf_s(s->status, ARRAYSIZE(s->status), fmt, ap);
+    _vsnwprintf_s(s->status, ARRAYSIZE(s->status), _TRUNCATE, fmt, ap);   /* reasons can be long */
     va_end(ap);
 }
 
@@ -545,14 +547,24 @@ static HANDLE start_moonlight(const wchar_t *args)
     return pi.hProcess;
 }
 
-/* Moonlight (SDL) will not start without a display: a sleeping DisplayPort monitor leaves the
-   host with none. Its log then says so and it exits at once. */
+/* Moonlight (SDL) will not start without a display. App Sandbox runs in the signed-in user's
+   Windows session; when another user is switched to (fast user switching) or a remote session
+   disconnects, that session stays alive but has no display, and Moonlight's log says "No displays
+   available" before it exits at once. */
 #define NO_DISPLAY_LOG      "No displays available"
-#define NO_DISPLAY_WHY      L"the host has no display (the monitor may be asleep); Moonlight needs one"
+#define NO_DISPLAY_WHY      L"App Sandbox's Windows session is not on screen (another user signed in, or disconnected)"
 
 static BOOL host_has_display(void)
 {
-    return GetSystemMetrics(SM_CMONITORS) > 0;
+    WTS_CONNECTSTATE_CLASS *state = NULL;
+    DWORD bytes = 0;
+    BOOL active = TRUE;
+    if (WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE, WTS_CURRENT_SESSION, WTSConnectState,
+                                    (LPWSTR *)&state, &bytes) && state) {
+        active = *state == WTSActive;
+        WTSFreeMemory(state);
+    }
+    return active && GetSystemMetrics(SM_CMONITORS) > 0;
 }
 
 /* The text of the newest Moonlight log created since `since` (2 s of clock slack), or NULL.
