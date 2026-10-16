@@ -134,12 +134,16 @@ class Client:
     def templates(self):         return self._req("GET", "/templates")[1].get("templates", [])
     def delete_template(self, name): return self._req("DELETE", "/templates/" + name)
     def ssh_info(self, name):    return self._req("GET", "/vms/%s/sshInfo" % name)[1]
-    def open_display(self, name):
+    def open_display(self, name, viewer=None):
         """Open the VM's display window on the daemon's local desktop (the GUI's
         Connect view). The VM must be running, and the daemon must be in an
         interactive session that can show a window (a headless/SSH/service daemon
         returns 409 "no_display"). Returns (status, body); status() reports
-        displayOpen, which also goes false if the user closes the window."""
+        displayOpen, which also goes false if the user closes the window.
+        viewer="native" opens Moonlight full screen for a nativeDisplay VM once
+        display_status() reports streamReady (409 "not_native" / "stream_not_ready")."""
+        if viewer:
+            return self._req("POST", "/vms/%s/display" % name, {"viewer": viewer})
         return self._req("POST", "/vms/%s/display" % name)
     def close_display(self, name): return self._req("DELETE", "/vms/%s/display" % name)
     def display_status(self, name):

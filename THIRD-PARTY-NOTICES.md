@@ -96,6 +96,25 @@ governs that file.
 
 ---
 
+## Downloaded at runtime, not bundled — Native display option
+
+These programs are not part of AppSandbox's source or releases. When a VM uses the
+Native display option, AppSandbox downloads a pinned release from the project's GitHub
+releases, checks its SHA-256, and runs it unmodified as a separate program.
+
+- **Sunshine** 2026.914.233613 (`Sunshine-Windows-AMD64-lite.zip`), installed by the guest
+  agent inside the VM to `%ProgramData%\AppSandbox\Sunshine`.
+  - **License:** GNU General Public License, version 3.
+  - **Copyright:** Copyright (c) LizardByte and Sunshine contributors.
+  - **Source:** <https://github.com/LizardByte/Sunshine>
+- **Moonlight** 6.2.0 (`MoonlightPortable-x64-6.2.0.zip`), installed on the host to
+  `%ProgramData%\AppSandbox\Moonlight`.
+  - **License:** GNU General Public License, version 3.
+  - **Copyright:** Copyright (c) Moonlight Game Streaming Project contributors.
+  - **Source:** <https://github.com/moonlight-stream/moonlight-qt>
+
+---
+
 ## AppSandbox's own Linux kernel module (not third-party)
 
 `tools/linux/asb_drm/` is **AppSandbox's own** code, intentionally dual-licensed

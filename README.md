@@ -64,6 +64,9 @@ Virtual Machine Platform is the same Windows feature WSL2 uses.
   Sandbox provides the desktop and the VM; the agent's own model loop runs inside the guest.
   Several agents can run at once, each in its own VM, on a single laptop or desktop.
 - Creating GPU-accelerated (**GPU-PV**) VMs, from the GUI or the headless API.
+- Running a Windows desktop at your monitor's own resolution and refresh rate (for example
+  5120×2160 at 120 Hz) for video, image work and light gaming, with the **Native display**
+  option (below).
 - Scripting the VM lifecycle from code — create, snapshot, branch, SSH into, and delete
   GPU-accelerated VMs — with the Python SDK.
 
@@ -82,6 +85,23 @@ runner. Provisioning a VM runs a full unattended install; snapshots, branches, a
 until deleted. A snapshot is a disk-state checkpoint taken with the VM stopped, and a branch
 forks a writable disk from it to run divergent actions. The full API reference and runnable
 examples are in [`tools/headless-api/`](tools/headless-api/).
+
+**Native display (Windows guests on a Windows host).** A create-time option that shows the
+guest at the host monitor's own mode, for example 5120×2160 at 120 Hz. App Sandbox's own
+viewer carries raw pixels and slows down at high resolutions (about 15 fps at 5120×2160), so
+this option streams instead: the guest's display driver offers the monitor's mode,
+[Sunshine](https://github.com/LizardByte/Sunshine) in the guest captures and hardware-encodes
+the screen, and [Moonlight](https://github.com/moonlight-stream/moonlight-qt) on the host shows
+it full screen. App Sandbox installs both, pairs them, and opens Moonlight from the VM's
+*Native* column, the tray's "Connect to native", or the headless API. It needs a Windows guest
+(built from an ISO or from a template, but not a template itself), NAT networking and a GPU,
+and it turns on Test Mode, because the display driver that takes a configurable mode is
+test-signed. Measured on a Radeon RX 9070 XT: 100–118 fps at 5120×2160@120 over HEVC. The raw
+viewer stays available for every VM and resizes the guest to its window; use it for elevated
+windows (UAC prompts, Task Manager), which Moonlight's mouse can't reach because Sunshine runs
+at standard privileges. Sunshine and Moonlight are GPL-3.0 and are downloaded at a pinned
+version, checked against a SHA-256, when first needed; they are not bundled (see
+[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)).
 
 **How it works:** this repo also aims to be a working example of creating full desktop VMs
 programmatically with the Windows HCS/HCN APIs and Apple's Virtualization.framework. On

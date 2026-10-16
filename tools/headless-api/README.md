@@ -75,6 +75,7 @@ in create-validation (wrong `osType` → `400`); the host-feature row mirrors
 | Snapshots & branches | ✅ | ❌ `501` |
 | Templates (`isTemplate`, create-from-template) | ✅ | ❌ `501` |
 | Display window (`/vms/{n}/display`) | ✅ | ✅ (daemon in a console GUI session) |
+| Native display (`nativeDisplay`, Sunshine + Moonlight) | ✅ | ❌ |
 | GPU, NAT/network modes, SSH server, SSH-key auto-deploy, SSE events | ✅ | ✅ |
 
 Only `snapshots`/`templates` are advertised in the `capabilities` object; guest
@@ -181,7 +182,7 @@ methods return `(http_status, body)` so you can branch on the status code.
 | Method | Returns |
 |---|---|
 | `version()` | `{product, version, apiVersion, hostOs, capabilities}` |
-| `host()` | `{hostCores, hostRamMb, freeGb, vmCores, vmRamMb, vmHddGb}` (capacity + what running/declared VMs use) |
+| `host()` | `{hostCores, hostRamMb, freeGb, vmCores, vmRamMb, vmHddGb}` (capacity + what running/declared VMs use); on Windows also `display` `{width, height, refresh, widthMm, heightMm, scale}` (primary monitor) and `nat` `{subnet, gateway}` |
 | `list()` | list of VM status objects |
 | `status(name)` | one VM's status (raises `KeyError` on 404) |
 | `ssh_info(name)` | `{host, port, user, sshState, enabled, keyDeployed}` (loopback-forwarded SSH; `sshState 4` = ready + key deployed) |
@@ -191,7 +192,9 @@ methods return `(http_status, body)` so you can branch on the status code.
 
 A **status object** has: `name, osType, state, running, agentOnline,
 installComplete, building, progress, sshState, sshPort, ramMb, hddGb, cpuCores,
-gpuMode, networkMode, displayOpen`.
+gpuMode, networkMode, displayOpen`. On Windows also `natIp`, `mac`, `autoStart`,
+`nativeDisplay` and, for a native display VM, `displayMode`, `streamState` and
+`streamStatus` (see [Native display](#native-display)).
 
 ### Lifecycle  *(return `(status, body)`)*
 | Method | Effect |
@@ -256,7 +259,7 @@ it (good in the GUI, wrong for a CLI).
 |---|---|
 | `display_status(name)` | `{open, ready}` — poll this; **no window is opened by polling** |
 | `display_ready(name)` | `bool` — shorthand for `display_status()["ready"]` |
-| `open_display(name)` | `(status, body)` — open (or focus) the window |
+| `open_display(name, viewer=None)` | `(status, body)` — open (or focus) the window; `viewer="native"` opens Moonlight instead (see [Native display](#native-display)) |
 | `close_display(name)` | `(status, body)` — close it |
 
 The pattern is **poll-then-open**:
@@ -292,6 +295,36 @@ c.close_display("dev")              # or the user just closes it with the [X]
   a `sudo` daemon launched from a Terminal in the active desktop works, but a launchd
   system daemon or SSH session is correctly refused (`409 no_display`).
 
+### Native display
+
+A VM created with `nativeDisplay` (Windows host, Windows guest) is shown through
+[Sunshine](https://github.com/LizardByte/Sunshine) in the guest and
+[Moonlight](https://github.com/moonlight-stream/moonlight-qt) on the host, at the host
+monitor's mode (or `displayWidth/Height/Refresh`). The daemon installs Moonlight, pairs it
+with each running native VM in the background and closes Moonlight when the VM stops.
+
+`display_status(name)` adds, for these VMs:
+
+| Field | Meaning |
+|---|---|
+| `viewer` | `"none"`, `"raw"` or `"moonlight"` — what is open now |
+| `streamReady` | Moonlight is paired and Sunshine answers: `open_display(name, viewer="native")` will stream |
+| `streamState` | `off` (VM not running) · `pairing` · `ready` · `healing` (recovering a failed stream by itself) · `failed` |
+| `streamStatus` | one line for people, e.g. `waiting for Sunshine to start in the guest (it starts at sign-in)` |
+
+```python
+c.create(name="dev", osType="Windows", imagePath=r"D:\iso\Win11.iso", adminUser="user",
+         adminPass="secret", gpuMode=1, networkMode=1, nativeDisplay=True)
+while not c.display_status("dev").get("streamReady"):
+    time.sleep(3)
+c.open_display("dev", viewer="native")   # Moonlight, full screen
+```
+
+`open_display(name)` without `viewer` opens the raw viewer as for any VM; the guest then
+follows that window's size and returns to the native mode when Moonlight opens again. One
+viewer is open at a time. Moonlight starts only while the daemon's Windows session is the
+active one (not switched away with fast user switching); `streamStatus` says so meanwhile.
+
 ---
 
 ## Create config & validation
@@ -318,6 +351,9 @@ rather than forwarding bad input to the core.
 | `sshEnabled` | provision SSH + forward a loopback port |
 | `sshDeployKey` | deploy the AppSandbox public key for password-less login (**requires `sshEnabled`**; rejected `400` otherwise) |
 | `isTemplate` | build a template (Windows only; can't be built from another template) |
+| `nativeDisplay` | Windows host only: stream the guest at the host monitor's mode through Sunshine + Moonlight (see [Native display](#native-display)). Needs a Windows guest that isn't a template, `networkMode` `1` (NAT) and a GPU; turns on `testMode`. |
+| `displayWidth`, `displayHeight`, `displayRefresh` | the native display mode; `0` or omitted = the host's primary monitor (`GET /host` → `display`). At most 5120×2160 pixels, 30–240 Hz. |
+| `autoStart` | start the VM when the GUI or daemon opens ("Start on Open"); not for templates. Also editable while stopped. |
 
 `edit()` accepts `ramMb`, `cpuCores`, `gpuMode`, `networkMode` with the same
 range rules, and **only while the VM is stopped**. `name` cannot be changed.
