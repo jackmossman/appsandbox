@@ -64,7 +64,19 @@ typedef struct {
     BOOL   is_template;            /* TRUE = create as template VM */
     const wchar_t *disk_directory; /* parent for a new VM folder; NULL/empty = default */
     const wchar_t *gpu_id;
+    /* Native display: the guest's virtual display runs at this mode and Sunshine streams it to
+       Moonlight on the host. Windows, NAT and a GPU only; forces test_mode (the VDD build with
+       configurable modes is test-signed). 0 x 0 @ 0 = the host's current display mode. */
+    BOOL   native_display;
+    DWORD  display_width, display_height, display_refresh;
 } AsbVmConfig;
+
+/* The host's primary display: current mode and the monitor's physical size from its EDID
+   (0 when unknown). */
+typedef struct {
+    DWORD width, height, refresh;
+    DWORD width_mm, height_mm;
+} AsbHostDisplay;
 
 /* ---- Snapshot/branch info (returned by query functions) ---- */
 
@@ -145,6 +157,13 @@ ASB_API const wchar_t *asb_validate_disk_directory(const wchar_t *name,
 
 ASB_API const wchar_t *asb_validate_template_disk_size(const wchar_t *template_name,
     DWORD hdd_gb);
+
+/* Checks for the native display option (asb_vm_create applies them too). os_type is the
+   effective guest OS (a template's, when creating from one). 0 x 0 @ 0 = the host's mode. */
+ASB_API const wchar_t *asb_validate_native_display(const wchar_t *os_type, BOOL is_template,
+    int network_mode, int gpu_mode, DWORD width, DWORD height, DWORD refresh);
+
+ASB_API BOOL asb_host_display(AsbHostDisplay *out);
 
 /* Start a VM.
    snap_idx: snapshot index (>= 0), -2 for base, -1 for current disk.

@@ -841,7 +841,8 @@ static void remove_staging_dir(const wchar_t *dir)
     RemoveDirectoryW(dir);
 }
 
-static void stage_agent_and_setup(const wchar_t *staging, const wchar_t *res_dir, BOOL ssh_enabled);
+static void stage_agent_and_setup(const wchar_t *staging, const wchar_t *res_dir, BOOL ssh_enabled,
+                                  const AsbNativeDisplayProvision *native_display);
 
 /* ---- SSH MSI download / cache ---- */
 
@@ -916,7 +917,7 @@ HRESULT iso_create_resources(const wchar_t *iso_path,
         ui_log(L"Warning: failed to write autounattend.xml");
 
     /* Agent + input helper + VDD driver files + SSH MSI */
-    stage_agent_and_setup(staging, res_dir, ssh_enabled);
+    stage_agent_and_setup(staging, res_dir, ssh_enabled, NULL);
 
     /* setup.cmd — first-logon script: installs agent service.
        This runs from the ISO drive, so %~dp0 is the ISO root. */
@@ -1190,7 +1191,8 @@ static BOOL generate_unattend_instance(const wchar_t *output_path,
 }
 
 /* Helper: copy agent exe to staging and write setup.cmd */
-static void stage_agent_and_setup(const wchar_t *staging, const wchar_t *res_dir, BOOL ssh_enabled)
+static void stage_agent_and_setup(const wchar_t *staging, const wchar_t *res_dir, BOOL ssh_enabled,
+                                  const AsbNativeDisplayProvision *native_display)
 {
     wchar_t src_path[MAX_PATH], file_path[MAX_PATH];
     BOOL found_agent = FALSE;
@@ -1472,7 +1474,12 @@ static void stage_agent_and_setup(const wchar_t *staging, const wchar_t *res_dir
                 "set LOG=%SystemRoot%\\AppSandbox\\setup.log\r\n"
                 "mkdir \"%SystemRoot%\\AppSandbox\" 2>nul\r\n"
                 "echo === SetupComplete.cmd started === >> \"%LOG%\"\r\n"
-                "\r\n"
+                "\r\n",
+                sc);
+            /* Before the VDD install: the driver reads its mode when the device starts. */
+            if (native_display)
+                asb_provision_native_display(sc, native_display);
+            fputs(
                 "REM Find ISO drive\r\n"
                 "set ISODRV=\r\n"
                 "for %%d in (D E F G H I J) do @if exist %%d:\\drivers\\AppSandboxVDD.inf set ISODRV=%%d:\r\n"
@@ -1498,7 +1505,17 @@ static void stage_agent_and_setup(const wchar_t *staging, const wchar_t *res_dir
                 "dir \"%ISODRV%\\drivers\\\" >> \"%LOG%\" 2>&1\r\n"
                 "\"%ISODRV%\\drivers\\devcon.exe\" install \"%ISODRV%\\drivers\\AppSandboxVDD.inf\" Root\\AppSandboxVDD >> \"%LOG%\" 2>&1\r\n"
                 "echo [VDD] devcon exit code: %errorlevel% >> \"%LOG%\"\r\n"
-                "\r\n"
+                "\r\n",
+                sc);
+            /* The template already had the VDD running at the stock mode: restart it so it
+               picks up the mode just written. */
+            if (native_display)
+                fputs(
+                    "echo [NATIVE] Restarting the VDD for the new mode... >> \"%LOG%\"\r\n"
+                    "\"%ISODRV%\\drivers\\devcon.exe\" restart Root\\AppSandboxVDD >> \"%LOG%\" 2>&1\r\n"
+                    "\r\n",
+                    sc);
+            fputs(
                 "REM Disable display sleep so IDD swap chain stays alive\r\n"
                 "powercfg /change monitor-timeout-ac 0\r\n"
                 "powercfg /change monitor-timeout-dc 0\r\n"
@@ -1546,7 +1563,8 @@ HRESULT iso_create_instance_resources(const wchar_t *iso_path,
                                        wchar_t *admin_pass,
                                        const wchar_t *res_dir,
                                        BOOL ssh_enabled,
-                                       const wchar_t *lang)
+                                       const wchar_t *lang,
+                                       const AsbNativeDisplayProvision *native_display)
 {
     wchar_t dir[MAX_PATH];
     wchar_t staging[MAX_PATH];
@@ -1589,7 +1607,7 @@ HRESULT iso_create_instance_resources(const wchar_t *iso_path,
     }
 
     /* Agent exe + setup.cmd + SSH MSI */
-    stage_agent_and_setup(staging, res_dir, ssh_enabled);
+    stage_agent_and_setup(staging, res_dir, ssh_enabled, native_display);
 
     /* Build ISO */
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
@@ -1795,13 +1813,14 @@ BOOL generate_vhdx_setup_cmd(const wchar_t *output_path)
    script additionally installs the AppSandboxSHM (ivshmem) + NetKVM (virtio-net) PCI
    drivers; both steps are if-exist-guarded and a no-op on a Windows host (no 1af4 PCI
    device present). "wb" keeps the generator's exact CRLF bytes. */
-BOOL generate_vhdx_setupcomplete(const wchar_t *output_path, BOOL ssh_enabled)
+BOOL generate_vhdx_setupcomplete(const wchar_t *output_path, BOOL ssh_enabled,
+                                 const AsbNativeDisplayProvision *native_display)
 {
     FILE *sc;
     int rc;
     if (_wfopen_s(&sc, output_path, L"wb") != 0 || !sc)
         return FALSE;
-    rc = asb_provision_setupcomplete(sc, ssh_enabled ? SSH_MSI_NAME_A : NULL);
+    rc = asb_provision_setupcomplete_ex(sc, ssh_enabled ? SSH_MSI_NAME_A : NULL, native_display);
     fclose(sc);
     return rc == 0;
 }

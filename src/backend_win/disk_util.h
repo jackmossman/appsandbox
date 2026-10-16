@@ -2,6 +2,7 @@
 #define DISK_UTIL_H
 
 #include <windows.h>
+#include "../../tools/provision/win_provision.h"   /* AsbNativeDisplayProvision */
 
 /* Compile-time target architecture. Build arch == host arch == guest arch
    (x64->x64->x64, ARM64->ARM->ARM; no cross-arch), so one compile-time flag
@@ -49,14 +50,15 @@ HRESULT iso_create_resources(const wchar_t *iso_path,
 
 /* Create a resources ISO for an instance created from a template.
    Contains unattend.xml (not autounattend.xml) for post-sysprep mini-setup
-   with the real user account, agent, and GPU copy setup. */
+   with the real user account, agent, and GPU copy setup. native_display may be NULL. */
 HRESULT iso_create_instance_resources(const wchar_t *iso_path,
                                        const wchar_t *vm_name,
                                        const wchar_t *admin_user,
                                        wchar_t *admin_pass,
                                        const wchar_t *res_dir,
                                        BOOL ssh_enabled,
-                                       const wchar_t *lang);
+                                       const wchar_t *lang,
+                                       const AsbNativeDisplayProvision *native_display);
 
 /* ---- VHDX-First VM Creation (no resources ISO) ---- */
 
@@ -83,8 +85,10 @@ BOOL generate_unattend_vhdx_template(const wchar_t *output_path,
 /* Generate setup.cmd for VHDX-first boot (agent already on disk). */
 BOOL generate_vhdx_setup_cmd(const wchar_t *output_path);
 
-/* Generate SetupComplete.cmd for VHDX-first boot (VDD driver files on disk). */
-BOOL generate_vhdx_setupcomplete(const wchar_t *output_path, BOOL ssh_enabled);
+/* Generate SetupComplete.cmd for VHDX-first boot (VDD driver files on disk).
+   native_display may be NULL. */
+BOOL generate_vhdx_setupcomplete(const wchar_t *output_path, BOOL ssh_enabled,
+                                 const AsbNativeDisplayProvision *native_display);
 
 /* Generate staging manifest for iso-patch --stage.
    Writes tab-separated source\tdest lines for all files to pre-stage on the VHDX.

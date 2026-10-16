@@ -25,7 +25,13 @@
 #include <shlobj.h>
 #include <stdarg.h>
 #include <virtdisk.h>
+#include <setupapi.h>
+#include <bcrypt.h>
+#include <wincrypt.h>
 #pragma comment(lib, "virtdisk.lib")
+#pragma comment(lib, "setupapi.lib")
+#pragma comment(lib, "bcrypt.lib")
+#pragma comment(lib, "crypt32.lib")
 
 /* ---- DLL module handle (for locating iso-patch.exe, resources, etc.) ---- */
 
@@ -101,6 +107,225 @@ ASB_API const wchar_t *asb_validate_gpu_selection(int gpu_mode, const wchar_t *g
     if (!find_gpu(gpu_id) || !gpu_is_available(gpu_id))
         return L"The selected GPU is no longer available. Choose another GPU or Default GPU.";
     return NULL;
+}
+
+/* ---- Native display ---- */
+
+/* The modes the guest VDD accepts (tools/vdd/vdd.h). The pixel limit is the host viewer's frame
+   buffer (vm_display_idd.c MAX_FRAME_DATA_SIZE). */
+#define NATIVE_MIN_WIDTH     640
+#define NATIVE_MIN_HEIGHT    480
+#define NATIVE_MAX_DIMENSION 8192
+#define NATIVE_MAX_PIXELS    (5120ull * 2160ull)
+#define NATIVE_MIN_REFRESH   30
+#define NATIVE_MAX_REFRESH   240
+
+/* Physical size of the monitor behind a monitor device interface, from its EDID: the first
+   detailed timing's image size (mm), else the base block's (cm). */
+static BOOL monitor_size_mm(const wchar_t *interface_path, DWORD *width_mm, DWORD *height_mm)
+{
+    HDEVINFO devs = SetupDiCreateDeviceInfoList(NULL, NULL);
+    SP_DEVICE_INTERFACE_DATA ifd = { sizeof(ifd) };
+    SP_DEVINFO_DATA dev = { sizeof(dev) };
+    BYTE edid[4096];   /* base block + extensions (often 256-512 bytes) */
+    DWORD size = sizeof(edid), type = 0;
+    BOOL ok = FALSE;
+    HKEY key;
+
+    if (devs == INVALID_HANDLE_VALUE) return FALSE;
+    if (SetupDiOpenDeviceInterfaceW(devs, interface_path, 0, &ifd) &&
+        SetupDiEnumDeviceInfo(devs, 0, &dev)) {
+        key = SetupDiOpenDevRegKey(devs, &dev, DICS_FLAG_GLOBAL, 0, DIREG_DEV, KEY_READ);
+        if (key != INVALID_HANDLE_VALUE) {
+            if (RegQueryValueExW(key, L"EDID", NULL, &type, edid, &size) == ERROR_SUCCESS && size >= 128) {
+                const BYTE *dtd = edid + 54;
+                DWORD w = 0, h = 0;
+                if (dtd[0] || dtd[1]) {
+                    w = dtd[12] | ((DWORD)(dtd[14] & 0xF0) << 4);
+                    h = dtd[13] | ((DWORD)(dtd[14] & 0x0F) << 8);
+                }
+                if (!w || !h) {
+                    w = edid[21] * 10u;
+                    h = edid[22] * 10u;
+                }
+                if (w && h) {
+                    *width_mm = w;
+                    *height_mm = h;
+                    ok = TRUE;
+                }
+            }
+            RegCloseKey(key);
+        }
+    }
+    SetupDiDestroyDeviceInfoList(devs);
+    return ok;
+}
+
+ASB_API BOOL asb_host_display(AsbHostDisplay *out)
+{
+    DISPLAY_DEVICEW adapter, monitor;
+    DEVMODEW dm;
+    DWORD i;
+
+    if (!out) return FALSE;
+    ZeroMemory(out, sizeof(*out));
+    for (i = 0; ; i++) {
+        ZeroMemory(&adapter, sizeof(adapter));
+        adapter.cb = sizeof(adapter);
+        if (!EnumDisplayDevicesW(NULL, i, &adapter, 0)) return FALSE;
+        if (adapter.StateFlags & DISPLAY_DEVICE_PRIMARY_DEVICE) break;
+    }
+    ZeroMemory(&dm, sizeof(dm));
+    dm.dmSize = sizeof(dm);
+    if (!EnumDisplaySettingsW(adapter.DeviceName, ENUM_CURRENT_SETTINGS, &dm)) return FALSE;
+    out->width = dm.dmPelsWidth;
+    out->height = dm.dmPelsHeight;
+    out->refresh = dm.dmDisplayFrequency;
+
+    ZeroMemory(&monitor, sizeof(monitor));
+    monitor.cb = sizeof(monitor);
+    if (EnumDisplayDevicesW(adapter.DeviceName, 0, &monitor, EDD_GET_DEVICE_INTERFACE_NAME))
+        monitor_size_mm(monitor.DeviceID, &out->width_mm, &out->height_mm);
+    return TRUE;
+}
+
+/* The mode a native display VM gets: the requested one, or the host's when none was given. */
+static BOOL native_display_mode(DWORD width, DWORD height, DWORD refresh,
+                                DWORD *out_w, DWORD *out_h, DWORD *out_r)
+{
+    if (!width && !height && !refresh) {
+        AsbHostDisplay host;
+        if (!asb_host_display(&host)) return FALSE;
+        width = host.width;
+        height = host.height;
+        refresh = host.refresh;
+    }
+    *out_w = width;
+    *out_h = height;
+    *out_r = refresh;
+    return TRUE;
+}
+
+ASB_API const wchar_t *asb_validate_native_display(const wchar_t *os_type, BOOL is_template,
+    int network_mode, int gpu_mode, DWORD width, DWORD height, DWORD refresh)
+{
+    static __declspec(thread) wchar_t message[256];   /* GUI and headless API threads */
+    DWORD w, h, r;
+
+    if (!os_type || _wcsicmp(os_type, L"Windows") != 0)
+        return L"Native display is available for Windows VMs only.";
+    if (is_template)
+        return L"Native display can't be used on a template; turn it on for VMs created from it.";
+    if (network_mode != NET_NAT)
+        return L"Native display streams over the NAT network; choose NAT.";
+    if (gpu_mode == GPU_NONE)
+        return L"Native display needs a GPU for hardware video encoding; choose a GPU.";
+    if (!native_display_mode(width, height, refresh, &w, &h, &r))
+        return L"Cannot read the host's display mode; enter the mode.";
+    if (w < NATIVE_MIN_WIDTH || h < NATIVE_MIN_HEIGHT || w > NATIVE_MAX_DIMENSION ||
+        h > NATIVE_MAX_DIMENSION || (ULONGLONG)w * h > NATIVE_MAX_PIXELS ||
+        r < NATIVE_MIN_REFRESH || r > NATIVE_MAX_REFRESH) {
+        swprintf_s(message, ARRAYSIZE(message),
+                   L"Native display mode %lux%lu@%lu is not supported: at most 5120x2160 pixels, "
+                   L"at least 640x480, %d-%d Hz.", w, h, r, NATIVE_MIN_REFRESH, NATIVE_MAX_REFRESH);
+        return message;
+    }
+    return NULL;
+}
+
+/* Sunshine web UI password: letters and digits only (it passes through the guest's
+   SetupComplete.cmd and sunshine.exe's command line). */
+static BOOL generate_stream_password(wchar_t *out, size_t cch)
+{
+    static const wchar_t ALNUM[] =
+        L"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    BYTE rnd[24];
+    size_t i;
+    if (cch < ARRAYSIZE(rnd) + 1) return FALSE;
+    if (BCryptGenRandom(NULL, rnd, sizeof(rnd), BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) return FALSE;
+    for (i = 0; i < ARRAYSIZE(rnd); i++)
+        out[i] = ALNUM[rnd[i] % (ARRAYSIZE(ALNUM) - 1)];
+    out[i] = L'\0';
+    SecureZeroMemory(rnd, sizeof(rnd));
+    return TRUE;
+}
+
+/* vms.cfg keeps the Sunshine password encrypted with DPAPI for the Windows account App Sandbox
+   runs as, base64-encoded. Another account (or another machine) cannot read it back. */
+static BOOL protect_secret(const wchar_t *plain, wchar_t *out_b64, DWORD cch)
+{
+    DATA_BLOB in, out = { 0 };
+    BOOL ok;
+    in.cbData = (DWORD)((wcslen(plain) + 1) * sizeof(wchar_t));
+    in.pbData = (BYTE *)plain;
+    if (!CryptProtectData(&in, L"App Sandbox streaming password", NULL, NULL, NULL,
+                          CRYPTPROTECT_UI_FORBIDDEN, &out))
+        return FALSE;
+    ok = CryptBinaryToStringW(out.pbData, out.cbData, CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF,
+                              out_b64, &cch);
+    LocalFree(out.pbData);
+    return ok;
+}
+
+static BOOL unprotect_secret(const wchar_t *b64, wchar_t *plain, size_t cch)
+{
+    BYTE bin[1024];
+    DWORD bin_len = sizeof(bin);
+    DATA_BLOB in, out = { 0 };
+    BOOL ok = FALSE;
+    if (!CryptStringToBinaryW(b64, 0, CRYPT_STRING_BASE64, bin, &bin_len, NULL, NULL))
+        return FALSE;
+    in.cbData = bin_len;
+    in.pbData = bin;
+    if (!CryptUnprotectData(&in, NULL, NULL, NULL, NULL, CRYPTPROTECT_UI_FORBIDDEN, &out))
+        return FALSE;
+    if (out.cbData >= sizeof(wchar_t) && out.cbData % sizeof(wchar_t) == 0 &&
+        out.cbData / sizeof(wchar_t) <= cch && ((wchar_t *)out.pbData)[out.cbData / sizeof(wchar_t) - 1] == L'\0') {
+        memcpy(plain, out.pbData, out.cbData);
+        ok = TRUE;
+    }
+    SecureZeroMemory(out.pbData, out.cbData);
+    LocalFree(out.pbData);
+    return ok;
+}
+
+/* The guest-side native display settings for SetupComplete.cmd; strings point into b. */
+typedef struct {
+    AsbNativeDisplayProvision nd;
+    char subnet[32];
+    char user[64];
+    char password[128];
+} NativeDisplayProvisionBuf;
+
+static const AsbNativeDisplayProvision *native_display_provision(const VmConfig *cfg,
+                                                                 NativeDisplayProvisionBuf *b)
+{
+    ZeroMemory(b, sizeof(*b));
+    if (!cfg->native_display) return NULL;
+    sprintf_s(b->subnet, sizeof(b->subnet), "%s.0/24", hcn_nat_subnet_base());
+    WideCharToMultiByte(CP_UTF8, 0, cfg->stream_user, -1, b->user, sizeof(b->user), NULL, NULL);
+    WideCharToMultiByte(CP_UTF8, 0, cfg->stream_password, -1, b->password, sizeof(b->password), NULL, NULL);
+    b->nd.width = cfg->display_width;
+    b->nd.height = cfg->display_height;
+    b->nd.refresh = cfg->display_refresh;
+    b->nd.width_mm = cfg->display_width_mm;
+    b->nd.height_mm = cfg->display_height_mm;
+    b->nd.allowed_subnet = b->subnet;
+    b->nd.user = b->user;
+    b->nd.password = b->password;
+    return &b->nd;
+}
+
+static void copy_native_display(VmInstance *inst, const VmConfig *cfg)
+{
+    inst->native_display = cfg->native_display;
+    inst->display_width = cfg->display_width;
+    inst->display_height = cfg->display_height;
+    inst->display_refresh = cfg->display_refresh;
+    inst->display_width_mm = cfg->display_width_mm;
+    inst->display_height_mm = cfg->display_height_mm;
+    wcscpy_s(inst->stream_user, ARRAYSIZE(inst->stream_user), cfg->stream_user);
+    wcscpy_s(inst->stream_password, ARRAYSIZE(inst->stream_password), cfg->stream_password);
 }
 
 /* Prepare the GL mapping-layer Plan9 share for a Windows GPU guest: ensure the
@@ -578,6 +803,23 @@ static void save_vm_list(void)
             fwprintf(f, L"SshPubKey=%s\n", g_vms[i].ssh_pubkey);
         if (g_vms[i].install_complete)
             fwprintf(f, L"InstallComplete=1\n");
+        if (g_vms[i].native_display) {
+            fwprintf(f, L"NativeDisplay=1\n");
+            fwprintf(f, L"DisplayMode=%lux%lu@%lu\n", g_vms[i].display_width,
+                     g_vms[i].display_height, g_vms[i].display_refresh);
+            if (g_vms[i].display_width_mm && g_vms[i].display_height_mm)
+                fwprintf(f, L"DisplaySizeMm=%lux%lu\n", g_vms[i].display_width_mm,
+                         g_vms[i].display_height_mm);
+            fwprintf(f, L"StreamUser=%s\n", g_vms[i].stream_user);
+            if (g_vms[i].stream_password[0]) {
+                wchar_t protected_b64[1024];
+                if (protect_secret(g_vms[i].stream_password, protected_b64, ARRAYSIZE(protected_b64)))
+                    fwprintf(f, L"StreamPasswordDpapi=%s\n", protected_b64);
+                else
+                    asb_log(L"Warning: cannot encrypt the streaming password for \"%s\" (%lu); not saved.",
+                            g_vms[i].name, GetLastError());
+            }
+        }
         fwprintf(f, L"\n");
     }
 
@@ -734,6 +976,26 @@ static void load_vm_list(void)
             wcsncpy_s(vm->ssh_pubkey, 512, line + 10, _TRUNCATE);
         else if (wcsncmp(line, L"InstallComplete=", 16) == 0)
             vm->install_complete = (_wtoi(line + 16) != 0);
+        else if (wcsncmp(line, L"NativeDisplay=", 14) == 0)
+            vm->native_display = (_wtoi(line + 14) != 0);
+        else if (wcsncmp(line, L"DisplayMode=", 12) == 0) {
+            if (swscanf_s(line + 12, L"%lux%lu@%lu", &vm->display_width, &vm->display_height,
+                          &vm->display_refresh) != 3)
+                vm->display_width = vm->display_height = vm->display_refresh = 0;
+        }
+        else if (wcsncmp(line, L"DisplaySizeMm=", 14) == 0) {
+            if (swscanf_s(line + 14, L"%lux%lu", &vm->display_width_mm, &vm->display_height_mm) != 2)
+                vm->display_width_mm = vm->display_height_mm = 0;
+        }
+        else if (wcsncmp(line, L"StreamUser=", 11) == 0)
+            wcsncpy_s(vm->stream_user, ARRAYSIZE(vm->stream_user), line + 11, _TRUNCATE);
+        else if (wcsncmp(line, L"StreamPasswordDpapi=", 20) == 0) {
+            if (!unprotect_secret(line + 20, vm->stream_password, ARRAYSIZE(vm->stream_password))) {
+                vm->stream_password[0] = L'\0';
+                asb_log(L"Warning: cannot decrypt the streaming password for \"%s\" (%lu); it was saved "
+                        L"by another Windows account or machine.", vm->name, GetLastError());
+            }
+        }
     }
 
     fclose(f);
@@ -1260,7 +1522,12 @@ static DWORD WINAPI vhdx_create_thread(LPVOID param)
 
     /* Generate SetupComplete.cmd */
     swprintf_s(file_path, MAX_PATH, L"%s\\SetupComplete.cmd", staging);
-    generate_vhdx_setupcomplete(file_path, args->config.ssh_enabled);
+    {
+        NativeDisplayProvisionBuf ndb;
+        generate_vhdx_setupcomplete(file_path, args->config.ssh_enabled,
+                                    native_display_provision(&args->config, &ndb));
+        SecureZeroMemory(&ndb, sizeof(ndb));
+    }
 
     /* Determine res_dir */
     GetModuleFileNameW(g_dll_module, exe_dir, MAX_PATH);
@@ -3146,6 +3413,10 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
                                                     config->name, config->is_template);
         if (!error) error = asb_validate_password(effective_os, config->password);
         if (!error) error = asb_validate_gpu_selection(config->gpu_mode, config->gpu_id);
+        if (!error && config->native_display)
+            error = asb_validate_native_display(effective_os, config->is_template, config->network_mode,
+                                                config->gpu_mode, config->display_width,
+                                                config->display_height, config->display_refresh);
         if (error) {
             asb_log(L"Error: %s", error);
             asb_alert(error);
@@ -3183,6 +3454,26 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
     }
     is_template_create = config->is_template;
     cfg.is_template = is_template_create;
+
+    if (config->native_display) {
+        AsbHostDisplay host;
+        cfg.native_display = TRUE;
+        cfg.test_mode = TRUE;   /* the VDD build with configurable modes is test-signed */
+        native_display_mode(config->display_width, config->display_height, config->display_refresh,
+                            &cfg.display_width, &cfg.display_height, &cfg.display_refresh);
+        /* Streamed full screen to the host monitor, so the guest gets that monitor's size (DPI). */
+        if (asb_host_display(&host)) {
+            cfg.display_width_mm = host.width_mm;
+            cfg.display_height_mm = host.height_mm;
+        }
+        wcscpy_s(cfg.stream_user, ARRAYSIZE(cfg.stream_user), L"appsandbox");
+        if (!generate_stream_password(cfg.stream_password, ARRAYSIZE(cfg.stream_password))) {
+            asb_log(L"Error: Cannot generate the streaming password.");
+            return E_FAIL;
+        }
+        asb_log(L"Native display: %lux%lu@%lu, %lux%lu mm.", cfg.display_width, cfg.display_height,
+                cfg.display_refresh, cfg.display_width_mm, cfg.display_height_mm);
+    }
 
     /* Defaults */
     if (cfg.hdd_gb == 0) cfg.hdd_gb = 64;
@@ -3360,6 +3651,7 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
             inst->ssh_enabled = cfg.ssh_enabled;
             inst->ssh_deploy_key = cfg.ssh_deploy_key;
             if (cfg.ssh_deploy_key) wcscpy_s(inst->ssh_pubkey, 512, ssh_pubkey);
+            copy_native_display(inst, &cfg);
             inst->building_vhdx = TRUE;
             inst->vhdx_progress = 0;
             memcpy(&inst->gpu_shares, &cfg.gpu_shares, sizeof(GpuDriverShareList));
@@ -3531,9 +3823,12 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
                partition extension when its child VHDX was enlarged. */
             if (_wcsicmp(cfg.os_type, L"Windows") == 0) {
                 wchar_t template_lang[32] = L"en-US";
+                NativeDisplayProvisionBuf ndb;
                 vm_load_language_json(g_templates[template_idx].vhdx_path, template_lang, 32);
                 hr = iso_create_instance_resources(res_iso, cfg.name, cfg.admin_user, cfg.admin_pass,
-                                                    res_dir_buf, cfg.ssh_enabled, template_lang);
+                                                    res_dir_buf, cfg.ssh_enabled, template_lang,
+                                                    native_display_provision(&cfg, &ndb));
+                SecureZeroMemory(&ndb, sizeof(ndb));
                 if (SUCCEEDED(hr)) {
                     wcscpy_s(cfg.resources_iso_path, MAX_PATH, res_iso);
                     vm_save_language_json(cfg.vhdx_path, template_lang);
@@ -3624,6 +3919,8 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
        paths set them inline on their own instance copies). */
     inst->ssh_deploy_key = cfg.ssh_deploy_key;
     if (cfg.ssh_deploy_key) wcscpy_s(inst->ssh_pubkey, 512, ssh_pubkey);
+    copy_native_display(inst, &cfg);
+    SecureZeroMemory(cfg.stream_password, sizeof(cfg.stream_password));
 
     { wchar_t sd[MAX_PATH]; swprintf_s(sd, MAX_PATH, L"%s\\snapshots", vhdx_dir);
       snapshot_init(&g_snap_trees[g_vm_count], sd); }

@@ -162,6 +162,15 @@
                 <label class="needs-windows" title="Disable Secure Boot and enable test-signing (required to load the test-signed guest drivers)"><input type="checkbox" id="test-mode"> Test Mode</label>
                 <label title="Exposes the VM's sshd on a host-loopback port, tunnelled over vsock"><input type="checkbox" id="ssh-enabled" onchange="onSshToggle()"> SSH Server</label>
                 <label title="Deploy the AppSandbox SSH public key so you can connect with key auth (requires SSH Server)"><input type="checkbox" id="ssh-deploy-key" disabled> Deploy SSH key</label>
+                <label class="needs-windows windows-host-only" title="Run the guest display at a native mode (default: this monitor's) and stream it with Sunshine to Moonlight on the host. Needs NAT and a GPU; turns on Test Mode. Sunshine and Moonlight are downloaded on first use."><input type="checkbox" id="native-display" onchange="onNativeDisplayToggle()"> Native display (streaming)</label>
+            </div>
+
+            <label class="native-display-row" style="display:none">Display mode:</label>
+            <div class="form-row native-display-row" style="display:none">
+                <input type="number" id="display-width" min="640" max="8192" class="input-sm"> &times;
+                <input type="number" id="display-height" min="480" max="8192" class="input-sm"> @
+                <input type="number" id="display-refresh" min="30" max="240" class="input-sm"> Hz
+                <span class="host-info" id="host-display"></span>
             </div>
         </div>
         </div>

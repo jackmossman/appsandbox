@@ -244,6 +244,19 @@ static void build_host_info_json(JsonBuilder *jb)
     jb_int(jb, L"freeGb", free_gb);
     jb_int(jb, L"vmHddGb", (int)vm_hdd_gb);
     jb_string(jb, L"defaultDiskDirectory", base_dir);
+    {
+        AsbHostDisplay hd;
+        if (asb_host_display(&hd)) {
+            jb_append(jb, L",\"display\":");
+            jb_object_begin(jb);
+            jb_int(jb, L"width", (int)hd.width);
+            jb_int(jb, L"height", (int)hd.height);
+            jb_int(jb, L"refresh", (int)hd.refresh);
+            jb_int(jb, L"widthMm", (int)hd.width_mm);
+            jb_int(jb, L"heightMm", (int)hd.height_mm);
+            jb_object_end(jb);
+        }
+    }
     jb_array_begin(jb, L"gpus");
     for (i = 0; gpu_list && i < gpu_list->count; i++) {
         if (i > 0) jb_append(jb, L",");
@@ -312,6 +325,13 @@ static void build_vm_json(JsonBuilder *jb, int i)
     jb_int(jb, L"sshState", (v->ssh_key_deployed && v->ssh_state == 2) ? 4 : v->ssh_state);
     jb_bool(jb, L"sshDeployKey", v->ssh_deploy_key);
     jb_bool(jb, L"sshKeyDeployed", v->ssh_key_deployed);
+    jb_bool(jb, L"nativeDisplay", v->native_display);
+    if (v->native_display) {
+        wchar_t mode[48];
+        swprintf_s(mode, ARRAYSIZE(mode), L"%lux%lu@%lu", v->display_width, v->display_height,
+                   v->display_refresh);
+        jb_string(jb, L"displayMode", mode);
+    }
 
     /* Snapshot tree */
     {
@@ -1064,6 +1084,10 @@ static void on_webview2_message(const wchar_t *json)
         json_get_bool(json, L"testMode", &cfg.test_mode);
         json_get_bool(json, L"sshEnabled", &cfg.ssh_enabled);
         json_get_bool(json, L"sshDeployKey", &cfg.ssh_deploy_key);
+        json_get_bool(json, L"nativeDisplay", &cfg.native_display);
+        if (json_get_int(json, L"displayWidth", &val) && val > 0) cfg.display_width = (DWORD)val;
+        if (json_get_int(json, L"displayHeight", &val) && val > 0) cfg.display_height = (DWORD)val;
+        if (json_get_int(json, L"displayRefresh", &val) && val > 0) cfg.display_refresh = (DWORD)val;
 
         {
             const wchar_t *error = asb_validate_gpu_selection(cfg.gpu_mode, cfg.gpu_id);

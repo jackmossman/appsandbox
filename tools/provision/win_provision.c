@@ -293,14 +293,46 @@ int asb_provision_setup_cmd(FILE *f) {
     return 0;
 }
 
+int asb_provision_native_display(FILE *f, const AsbNativeDisplayProvision *nd) {
+    if (!f || !nd) return -1;
+    fprintf(f,
+        "REM ---- Native display: VDD mode (read when the device starts) and Sunshine settings for the agent\r\n"
+        "echo [NATIVE] Display %ux%u@%u >> \"%%LOG%%\"\r\n"
+        "reg add HKLM\\SOFTWARE\\AppSandbox\\VDD /v Width /t REG_DWORD /d %u /f >> \"%%LOG%%\" 2>&1\r\n"
+        "reg add HKLM\\SOFTWARE\\AppSandbox\\VDD /v Height /t REG_DWORD /d %u /f >> \"%%LOG%%\" 2>&1\r\n"
+        "reg add HKLM\\SOFTWARE\\AppSandbox\\VDD /v RefreshRate /t REG_DWORD /d %u /f >> \"%%LOG%%\" 2>&1\r\n",
+        nd->width, nd->height, nd->refresh, nd->width, nd->height, nd->refresh);
+    if (nd->width_mm && nd->height_mm)
+        fprintf(f,
+            "reg add HKLM\\SOFTWARE\\AppSandbox\\VDD /v WidthMm /t REG_DWORD /d %u /f >> \"%%LOG%%\" 2>&1\r\n"
+            "reg add HKLM\\SOFTWARE\\AppSandbox\\VDD /v HeightMm /t REG_DWORD /d %u /f >> \"%%LOG%%\" 2>&1\r\n",
+            nd->width_mm, nd->height_mm);
+    fprintf(f,
+        "reg add HKLM\\SOFTWARE\\AppSandbox\\Streaming /v Enabled /t REG_DWORD /d 1 /f >> \"%%LOG%%\" 2>&1\r\n"
+        "reg add HKLM\\SOFTWARE\\AppSandbox\\Streaming /v AllowedSubnet /t REG_SZ /d %s /f >> \"%%LOG%%\" 2>&1\r\n"
+        "reg add HKLM\\SOFTWARE\\AppSandbox\\Streaming /v User /t REG_SZ /d %s /f >> \"%%LOG%%\" 2>&1\r\n"
+        "reg add HKLM\\SOFTWARE\\AppSandbox\\Streaming /v Password /t REG_SZ /d %s /f >> \"%%LOG%%\" 2>&1\r\n"
+        "\r\n",
+        nd->allowed_subnet ? nd->allowed_subnet : "",
+        nd->user ? nd->user : "", nd->password ? nd->password : "");
+    return ferror(f) ? -1 : 0;
+}
+
 int asb_provision_setupcomplete(FILE *f, const char *ssh_msi_name) {
+    return asb_provision_setupcomplete_ex(f, ssh_msi_name, NULL);
+}
+
+int asb_provision_setupcomplete_ex(FILE *f, const char *ssh_msi_name, const AsbNativeDisplayProvision *nd) {
     if (!f) return -1;
     fputs(
         "@echo off\r\n"
         "set LOG=%SystemRoot%\\AppSandbox\\setup.log\r\n"
         "mkdir \"%SystemRoot%\\AppSandbox\" 2>nul\r\n"
         "echo === SetupComplete.cmd started === >> \"%LOG%\"\r\n"
-        "\r\n"
+        "\r\n",
+        f);
+    if (nd && asb_provision_native_display(f, nd) != 0) return -1;
+    fputs(
         "set DRVDIR=%SystemRoot%\\AppSandbox\\drivers\r\n"
         "if not exist \"%DRVDIR%\\AppSandboxVDD.inf\" goto :done\r\n"
         "\r\n"

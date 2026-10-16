@@ -19,4 +19,9 @@ void streaming_start(StreamLogFn log);
 /* Stops that thread and Sunshine (service stop and OS shutdown). */
 void streaming_stop(void);
 
+/* The host assigned the guest ip/prefix (set_ip). The NAT subnet can differ from the one written
+   at provisioning (the host falls back to another /24 when one clashes), so the firewall rule
+   follows it. */
+void streaming_network_changed(const char *ip, int prefix);
+
 #endif

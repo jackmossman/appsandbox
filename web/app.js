@@ -124,7 +124,7 @@ function applyOsTypeUI() {
     revalidateVmName();
     revalidateUsername();
     revalidatePassword();
-    updateCreateButtons();
+    onNativeDisplayToggle();   /* hides the mode row and releases Test Mode/NAT off Windows */
 }
 
 /* Unified dispatch. Native code on either platform calls
@@ -542,7 +542,7 @@ function createValidationError(isTemplate) {
         document.getElementById('template-select').value !== '';
     if ((isTemplate || osType !== 'macOS') && !hasImage && (isTemplate || !hasTemplate))
         return 'Select an OS image or an available template.';
-    return null;
+    return nativeDisplayError(isTemplate);
 }
 
 function updateCreateButtons() {
@@ -655,8 +655,64 @@ function gatherConfig() {
         adminConfirm: document.getElementById('admin-confirm').value,
         testMode:    document.getElementById('test-mode').checked,
         sshEnabled:  document.getElementById('ssh-enabled').checked,
-        sshDeployKey: document.getElementById('ssh-deploy-key').checked
+        sshDeployKey: document.getElementById('ssh-deploy-key').checked,
+        nativeDisplay: nativeDisplayOn(),
+        displayWidth:   nativeDisplayOn() ? document.getElementById('display-width').valueAsNumber : 0,
+        displayHeight:  nativeDisplayOn() ? document.getElementById('display-height').valueAsNumber : 0,
+        displayRefresh: nativeDisplayOn() ? document.getElementById('display-refresh').valueAsNumber : 0
     };
+}
+
+/* ---- Native display (streaming) ---- */
+
+function nativeDisplayOn() {
+    return !hostBridge.isMac && document.getElementById('os-type').value === 'Windows' &&
+        document.getElementById('native-display').checked;
+}
+
+/* Native display needs Test Mode (test-signed display driver) and NAT (Sunshine is reachable
+   from the host only over the NAT subnet), so it holds both while on. The core enforces the
+   same rules; this keeps the form honest. */
+function onNativeDisplayToggle() {
+    var on = nativeDisplayOn();
+    var rows = document.querySelectorAll('.native-display-row');
+    for (var i = 0; i < rows.length; i++) rows[i].style.display = on ? '' : 'none';
+    var test = document.getElementById('test-mode');
+    var net = document.getElementById('net-mode');
+    if (on) {
+        test.checked = true;
+        net.value = '1';
+        if (selectedGpu('gpu-mode').gpuMode === 0) setGpuSelection('gpu-mode', { gpuMode: 1 });
+        onNetModeChange();
+    }
+    test.disabled = on;
+    net.disabled = on;
+    updateCreateButtons();
+}
+
+/* Default mode: the host monitor's, which the stream is shown on full screen. */
+function setNativeDisplayDefaults(info) {
+    var d = info && info.display;
+    var note = document.getElementById('host-display');
+    if (!d) { note.textContent = ''; return; }
+    document.getElementById('display-width').value = d.width;
+    document.getElementById('display-height').value = d.height;
+    document.getElementById('display-refresh').value = d.refresh;
+    note.textContent = 'This monitor: ' + d.width + ' × ' + d.height + ' @ ' + d.refresh + ' Hz';
+}
+
+function nativeDisplayError(isTemplate) {
+    if (!nativeDisplayOn()) return null;
+    if (isTemplate) return 'Native display can\'t be used on a template; turn it on for VMs created from it.';
+    if (selectedGpu('gpu-mode').gpuMode === 0) return 'Native display needs a GPU for hardware video encoding.';
+    var w = document.getElementById('display-width'), h = document.getElementById('display-height'),
+        r = document.getElementById('display-refresh');
+    if (w.value === '' || h.value === '' || r.value === '' ||
+        !w.validity.valid || !h.validity.valid || !r.validity.valid)
+        return 'Display mode must be at least 640 × 480, at most 8192 on a side, 30-240 Hz.';
+    if (w.valueAsNumber * h.valueAsNumber > 5120 * 2160)
+        return 'Display mode can be at most 5120 × 2160 pixels.';
+    return null;
 }
 
 /* "Deploy SSH key" depends on "SSH Server": grey it out (and clear it) unless
@@ -824,6 +880,8 @@ function openCreateModal() {
     document.getElementById('ssh-enabled').checked = false;
     document.getElementById('ssh-deploy-key').checked = false;
     onSshToggle();   /* re-grey "Deploy SSH key" to match the cleared SSH checkbox */
+    document.getElementById('native-display').checked = false;
+    setNativeDisplayDefaults(lastHostInfo);
     /* Reset OS type to Windows on each open. Valid on both hosts (a Mac host
        supports Windows via QEMU); the user can switch to macOS on a Mac. */
     document.getElementById('os-type').value = 'Windows';

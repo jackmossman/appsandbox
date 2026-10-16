@@ -267,6 +267,11 @@ static int append_vm_json(char *out, int cap, int pos, VmInstance *v)
     pos = append_wstr(out, cap, pos, v->gpu_id);
     pos += sprintf_s(out + pos, cap - pos, ",\"gpuName\":");
     pos = append_wstr(out, cap, pos, v->gpu_name);
+    pos += sprintf_s(out + pos, cap - pos, ",\"nativeDisplay\":%s", v->native_display ? "true" : "false");
+    if (v->native_display)
+        pos += sprintf_s(out + pos, cap - pos, ",\"displayMode\":\"%lux%lu@%lu\"",
+                         (unsigned long)v->display_width, (unsigned long)v->display_height,
+                         (unsigned long)v->display_refresh);
     pos += sprintf_s(out + pos, cap - pos, "}");
     return pos;
 }
@@ -297,6 +302,14 @@ static int build_host_info(char *buf, int cap)
         vmCores, vmRamMb, vmHddGb);
     asb_default_disk_directory(pd, MAX_PATH);
     pos = append_wstr(buf, cap, pos, pd);
+    {
+        AsbHostDisplay hd;
+        if (asb_host_display(&hd))
+            pos += sprintf_s(buf + pos, cap - pos,
+                ",\"display\":{\"width\":%lu,\"height\":%lu,\"refresh\":%lu,\"widthMm\":%lu,\"heightMm\":%lu}",
+                (unsigned long)hd.width, (unsigned long)hd.height, (unsigned long)hd.refresh,
+                (unsigned long)hd.width_mm, (unsigned long)hd.height_mm);
+    }
     pos += sprintf_s(buf + pos, cap - pos, ",\"gpus\":[");
     for (i = 0; gpus && i < gpus->count; i++) {
         if (i) pos += sprintf_s(buf + pos, cap - pos, ",");
@@ -712,6 +725,30 @@ static int handle_request(PHTTP_REQUEST req)
                 send_err(req->RequestId, 400, "Bad Request", "invalid_arg",
                          "sshDeployKey requires sshEnabled");
                 return 0;
+            }
+            if (json_get_bool(body, L"nativeDisplay", &bv)) cfg.native_display = bv;
+            if (json_get_int(body, L"displayWidth", &iv) && iv > 0) cfg.display_width = (DWORD)iv;
+            if (json_get_int(body, L"displayHeight", &iv) && iv > 0) cfg.display_height = (DWORD)iv;
+            if (json_get_int(body, L"displayRefresh", &iv) && iv > 0) cfg.display_refresh = (DWORD)iv;
+            if (cfg.native_display) {
+                const wchar_t *native_os = os;
+                const wchar_t *verr;
+                for (i = 0; tpl[0] && i < asb_template_count(); i++) {
+                    if (_wcsicmp(tpl, asb_template_name(i)) == 0) {
+                        native_os = asb_template_os_type(i);
+                        break;
+                    }
+                }
+                verr = asb_validate_native_display(native_os, cfg.is_template, cfg.network_mode,
+                                                   cfg.gpu_mode, cfg.display_width, cfg.display_height,
+                                                   cfg.display_refresh);
+                if (verr) {
+                    char message[512];
+                    WideCharToMultiByte(CP_UTF8, 0, verr, -1, message, sizeof(message), NULL, NULL);
+                    SecureZeroMemory(pass, sizeof(pass));
+                    send_err(req->RequestId, 400, "Bad Request", "invalid_arg", message);
+                    return 0;
+                }
             }
             {
                 const wchar_t *password_os = os;

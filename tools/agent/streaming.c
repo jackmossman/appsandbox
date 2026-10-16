@@ -52,6 +52,8 @@ static wchar_t       g_dir[MAX_PATH];       /* <base>\Sunshine */
 static wchar_t       g_exe[MAX_PATH];       /* <dir>\sunshine.exe */
 static HANDLE        g_sunshine;            /* Sunshine we started, or NULL */
 static DWORD         g_sunshine_session = 0xFFFFFFFF;
+static SRWLOCK       g_subnet_lock = SRWLOCK_INIT;   /* g_subnet, g_new_subnet */
+static wchar_t       g_new_subnet[64];      /* from set_ip, applied by the thread; "" = none */
 
 /* ---- processes ---- */
 
@@ -513,6 +515,21 @@ static DWORD WINAPI streaming_thread(LPVOID param)
 
     while (g_running) {
         ULONGLONG now = GetTickCount64();
+        wchar_t subnet[64] = L"";
+
+        AcquireSRWLockExclusive(&g_subnet_lock);
+        if (g_new_subnet[0]) {
+            wcscpy_s(subnet, 64, g_new_subnet);
+            wcscpy_s(g_subnet, 64, g_new_subnet);
+            g_new_subnet[0] = L'\0';
+        }
+        ReleaseSRWLockExclusive(&g_subnet_lock);
+        if (subnet[0]) {
+            LOG("Streaming: NAT subnet is now %ls.", subnet);
+            RegSetKeyValueW(HKEY_LOCAL_MACHINE, STREAM_REG_KEY, L"AllowedSubnet", REG_SZ, subnet,
+                            (DWORD)((wcslen(subnet) + 1) * sizeof(wchar_t)));
+            apply_firewall();
+        }
 
         if (!ready) {
             /* First boot: the network may not be up yet, so retry with a growing wait. */
@@ -602,6 +619,24 @@ void streaming_start(StreamLogFn log)
         LOG("Streaming: cannot start thread (%lu).", GetLastError());
     }
 #endif
+}
+
+void streaming_network_changed(const char *ip, int prefix)
+{
+    unsigned a, b, c, d;
+    DWORD net;
+    wchar_t subnet[64];
+
+    if (!g_thread || prefix < 8 || prefix > 30 || sscanf_s(ip, "%u.%u.%u.%u", &a, &b, &c, &d) != 4 ||
+        a > 255 || b > 255 || c > 255 || d > 255)
+        return;
+    net = ((a << 24) | (b << 16) | (c << 8) | d) & (0xFFFFFFFFu << (32 - prefix));
+    swprintf_s(subnet, 64, L"%lu.%lu.%lu.%lu/%d", net >> 24, (net >> 16) & 255, (net >> 8) & 255,
+               net & 255, prefix);
+    AcquireSRWLockExclusive(&g_subnet_lock);
+    if (wcscmp(subnet, g_subnet) != 0)
+        wcscpy_s(g_new_subnet, 64, subnet);
+    ReleaseSRWLockExclusive(&g_subnet_lock);
 }
 
 void streaming_stop(void)

@@ -2110,6 +2110,7 @@ static void handle_client(AsbConn *client)
 
                     agent_log("IP configured: %s/%s gw %s dns %s,8.8.8.8",
                               ip, prefix, gateway, gateway);
+                    streaming_network_changed(ip, atoi(prefix));
                     REPLY("ok");
                 } else {
                     agent_log("netsh failed (exit %lu)", exit_code);
