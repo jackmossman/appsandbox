@@ -163,6 +163,11 @@ static BOOL monitor_size_mm(const wchar_t *interface_path, DWORD *width_mm, DWOR
     return ok;
 }
 
+ASB_API const char *asb_nat_subnet_base(void)
+{
+    return hcn_nat_subnet_base();
+}
+
 ASB_API BOOL asb_host_display(AsbHostDisplay *out)
 {
     DISPLAY_DEVICEW adapter, monitor;

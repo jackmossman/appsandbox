@@ -20,4 +20,8 @@ BOOL vm_stream_is_open(UINT64 vm_id);
 BOOL vm_stream_is_ready(UINT64 vm_id);
 void vm_stream_close(UINT64 vm_id);
 
+/* One line on where the VM's stream stands (installing, waiting for Sunshine, pairing, ready,
+   streaming, or what failed); empty for a VM without the native display option. */
+void vm_stream_status(UINT64 vm_id, wchar_t *out, size_t cch);
+
 #endif

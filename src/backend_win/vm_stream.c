@@ -4,12 +4,20 @@
  * A VM created with the native display option runs Sunshine in the guest (tools/agent/streaming.c).
  * This is the host half. Moonlight is GPL-3 and App Sandbox is MIT, so Moonlight is downloaded on
  * first use rather than shipped: one pinned release, checked against its SHA-256 before anything is
- * extracted, into %ProgramData%\AppSandbox\Moonlight. Moonlight keeps its own settings and pairings
- * per user in HKCU.
+ * extracted, into %ProgramData%\AppSandbox\Moonlight. It is the portable build: its settings and
+ * pairings are in Moonlight.ini there, and only when it is started with that folder as its working
+ * directory (otherwise it uses the user's own Moonlight profile in HKCU).
  *
  * One monitor thread does the slow work: installing Moonlight, and pairing it with each running
  * VM's Sunshine (Moonlight's "pair" command plus the PIN submitted through Sunshine's web API, with
- * the credentials generated at create). It also closes Moonlight when its VM stops.
+ * the credentials generated at create). It also closes Moonlight when its VM stops, and removes a
+ * deleted VM's host records.
+ *
+ * A launched stream is watched in Moonlight's log until the video stream starts. Moonlight does
+ * not always exit when it cannot stream: with a host record that names another server at the VM's
+ * address it waits forever ("Found unexpected PC"). A stream that reports an error, exits, or has
+ * not started within STREAM_START_MS is ended; the VM is paired again from scratch and the stream
+ * relaunched once. Each slot keeps a one-line status for the GUI and the API.
  * vm_stream_open only launches, so it is safe on the UI thread and the API request loop; until a VM
  * is ready it returns FALSE and the caller opens the raw viewer.
  */
@@ -18,6 +26,8 @@
 #include <windows.h>
 #include <winhttp.h>
 #include <bcrypt.h>
+#include <share.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -40,15 +50,27 @@
 #define CHECK_RETRY_MS      10000       /* between checks while Sunshine is not up yet */
 #define PAIR_RETRY_MS       60000       /* after a failed pairing, doubling to PAIR_RETRY_MAX_MS: each */
 #define PAIR_RETRY_MAX_MS   600000      /* attempt can show a Moonlight dialog on failure */
-#define EARLY_EXIT_MS       10000       /* a stream that ends this soon after launch failed */
+#define NO_DISPLAY_RETRY_MS 15000       /* while the host has no display (Moonlight cannot start) */
+#define STREAM_START_MS     30000       /* a launched stream must start its video within this */
+#define STREAM_RELAUNCHES   1           /* automatic relaunches after a failed stream, per open */
 
 typedef struct {
     UINT64      vm_id;
     BOOL        ready;          /* Moonlight is paired with this VM's Sunshine */
     HANDLE      moonlight;      /* running stream, or NULL */
     ULONGLONG   launched;       /* GetTickCount64() at launch */
+    FILETIME    launched_ft;    /* the same, as wall time: picks this launch's Moonlight log */
+    BOOL        watching;       /* launched, video not started yet */
+    BOOL        force_pair;     /* pair again even if both sides hold a pairing */
+    BOOL        relaunch;       /* launch again once ready */
+    int         relaunches;     /* automatic relaunches since the last open */
     ULONGLONG   next_check;     /* earliest next pairing check */
     ULONGLONG   pair_wait;      /* current wait after a failed pairing */
+    char        ip[32];         /* the VM's address and Sunshine's server uuid, kept so a */
+    char        uuid[64];       /* deleted VM's Moonlight records can be removed */
+    wchar_t     name[64];
+    wchar_t     status[200];    /* one line for the GUI and the API */
+    wchar_t     last_error[160];/* why the last stream failed, until one starts */
 } StreamSlot;
 
 /* What the monitor thread needs from a VmInstance, copied so slow work never holds the pointer. */
@@ -58,6 +80,8 @@ typedef struct {
     char        ip[32];
     wchar_t     user[32];
     wchar_t     password[64];
+    BOOL        force;          /* pair again from scratch */
+    char        uuid[64];       /* out: Sunshine's server uuid */
 } StreamTarget;
 
 static StreamSlot       g_slots[ASB_MAX_VMS];
@@ -88,6 +112,14 @@ static StreamSlot *slot_find(UINT64 vm_id, BOOL add)   /* caller holds g_lock */
             return &g_slots[i];
         }
     return NULL;
+}
+
+static void set_status(StreamSlot *s, const wchar_t *fmt, ...)   /* caller holds g_lock */
+{
+    va_list ap;
+    va_start(ap, fmt);
+    vswprintf_s(s->status, ARRAYSIZE(s->status), fmt, ap);
+    va_end(ap);
 }
 
 /* Run a command hidden and wait for it. cmd must be writable. Returns its exit code. */
@@ -384,10 +416,11 @@ typedef struct { char *line; int index; } IniLine;
 
 static char *read_text(const wchar_t *path, size_t *len)
 {
-    FILE *f = NULL;
+    FILE *f;
     char *buf;
     long n;
-    if (_wfopen_s(&f, path, L"rb") != 0 || !f) return NULL;
+    /* Shared: Moonlight keeps its log open while it runs, and _wfopen_s opens files unshared. */
+    if (!(f = _wfsopen(path, L"rb", _SH_DENYNO))) return NULL;
     fseek(f, 0, SEEK_END);
     n = ftell(f);
     fseek(f, 0, SEEK_SET);
@@ -426,13 +459,14 @@ static BOOL moonlight_paired(const char *uuid)
     return paired;
 }
 
-/* Remove host records for this address or server uuid, renumbering the rest. */
-static void moonlight_forget(const char *ip, const char *uuid)
+/* Remove host records for this address or server uuid, except the record for keep_uuid (when
+   given), renumbering the rest. */
+static void moonlight_forget(const char *ip, const char *uuid, const char *keep_uuid)
 {
     size_t len = 0;
     char *text = read_text(g_ini, &len), *line, *next;
-    char addr_local[64], addr_manual[64], uuid_line[96];
-    BOOL drop[256] = { 0 }, in_hosts = FALSE;
+    char addr_local[64], addr_manual[64], uuid_line[96], keep_line[96];
+    BOOL drop[256] = { 0 }, keep[256] = { 0 }, in_hosts = FALSE;
     int map[256] = { 0 }, kept = 0, i, n, removed = 0;
     FILE *f = NULL;
     char **lines;
@@ -441,7 +475,8 @@ static void moonlight_forget(const char *ip, const char *uuid)
     if (!text) return;
     sprintf_s(addr_local, sizeof(addr_local), "localaddress=%s", ip);
     sprintf_s(addr_manual, sizeof(addr_manual), "manualaddress=%s", ip);
-    sprintf_s(uuid_line, sizeof(uuid_line), "uuid=%s", uuid ? uuid : "-");
+    sprintf_s(uuid_line, sizeof(uuid_line), "uuid=%s", uuid && uuid[0] ? uuid : "-");
+    sprintf_s(keep_line, sizeof(keep_line), "uuid=%s", keep_uuid && keep_uuid[0] ? keep_uuid : "-");
 
     lines = (char **)calloc(len / 2 + 2, sizeof(char *));
     if (!lines) { free(text); return; }
@@ -456,9 +491,14 @@ static void moonlight_forget(const char *ip, const char *uuid)
             const char *field = strchr(lines[i], '\\') + 1;
             if (strcmp(field, addr_local) == 0 || strcmp(field, addr_manual) == 0 || strcmp(field, uuid_line) == 0)
                 drop[n] = TRUE;
+            if (strcmp(field, keep_line) == 0)
+                keep[n] = TRUE;
         }
     }
-    for (n = 1; n < 256; n++) if (drop[n]) removed++;
+    for (n = 1; n < 256; n++) {
+        if (keep[n]) drop[n] = FALSE;
+        if (drop[n]) removed++;
+    }
     if (!removed) { free(lines); free(text); return; }
 
     /* New numbering for the hosts that stay. */
@@ -483,7 +523,7 @@ static void moonlight_forget(const char *ip, const char *uuid)
             fprintf(f, "%s\r\n", lines[i]);
         }
         fclose(f);
-        ui_log(L"Moonlight: removed %d stale host record(s) for %S.", removed, ip);
+        ui_log(L"Moonlight: removed %d host record(s) for %S.", removed, ip);
     }
     free(lines);
     free(text);
@@ -505,16 +545,59 @@ static HANDLE start_moonlight(const wchar_t *args)
     return pi.hProcess;
 }
 
+/* Moonlight (SDL) will not start without a display: a sleeping DisplayPort monitor leaves the
+   host with none. Its log then says so and it exits at once. */
+#define NO_DISPLAY_LOG      "No displays available"
+#define NO_DISPLAY_WHY      L"the host has no display (the monitor may be asleep); Moonlight needs one"
+
+static BOOL host_has_display(void)
+{
+    return GetSystemMetrics(SM_CMONITORS) > 0;
+}
+
+/* The text of the newest Moonlight log created since `since` (2 s of clock slack), or NULL.
+   Each Moonlight run writes its own Moonlight-<time>.log in its folder. */
+static char *moonlight_log_since(const FILETIME *since_ft)
+{
+    wchar_t pattern[MAX_PATH], path[MAX_PATH], best[MAX_PATH] = L"";
+    WIN32_FIND_DATAW fd;
+    ULARGE_INTEGER since, created, newest = { 0 };
+    HANDLE find;
+    size_t len = 0;
+
+    since.LowPart = since_ft->dwLowDateTime;
+    since.HighPart = since_ft->dwHighDateTime;
+    since.QuadPart -= 20000000ULL;
+    swprintf_s(pattern, ARRAYSIZE(pattern), L"%s\\Moonlight-*.log", g_dir);
+    find = FindFirstFileW(pattern, &fd);
+    if (find == INVALID_HANDLE_VALUE) return NULL;
+    do {
+        created.LowPart = fd.ftCreationTime.dwLowDateTime;
+        created.HighPart = fd.ftCreationTime.dwHighDateTime;
+        if (created.QuadPart >= since.QuadPart && created.QuadPart >= newest.QuadPart) {
+            newest = created;
+            wcscpy_s(best, ARRAYSIZE(best), fd.cFileName);
+        }
+    } while (FindNextFileW(find, &fd));
+    FindClose(find);
+    if (!best[0]) return NULL;
+    swprintf_s(path, ARRAYSIZE(path), L"%s\\%s", g_dir, best);
+    return read_text(path, &len);
+}
+
 /* Pair Moonlight with the VM's Sunshine: Moonlight's "pair" waits for Sunshine to accept its PIN,
    which we submit through Sunshine's API (what its web UI's PIN page does). The result is judged
    by the caller from both sides' records, not from this exchange. Moonlight's "pair" ends on a
-   modal result dialog it never dismisses, so it is ended as soon as both sides hold the pairing. */
-static void pair(const StreamTarget *t, const char *uuid)
+   modal result dialog it never dismisses, so it is ended as soon as both sides hold the pairing.
+   TRUE when Moonlight could not start for want of a display. */
+static BOOL pair(const StreamTarget *t, const char *uuid)
 {
     wchar_t args[128];
-    char resp[2048], pairing_id[128], body[512], name[96];
+    char resp[2048], pairing_id[128], body[512], name[96], *text;
     DWORD code = 0, get_status = 0, post_status = 0;
     unsigned pin_value = 0;
+    FILETIME started;
+    BOOL no_display = FALSE;
     HANDLE proc;
     int i;
 
@@ -523,8 +606,9 @@ static void pair(const StreamTarget *t, const char *uuid)
     client_name(name, sizeof(name));
 
     swprintf_s(args, ARRAYSIZE(args), L"pair %S --pin %04u", t->ip, pin_value);
+    GetSystemTimeAsFileTime(&started);
     proc = start_moonlight(args);
-    if (!proc) return;
+    if (!proc) return FALSE;
     pairing_id[0] = '\0';
     for (i = 0; i < 30 && g_running && !post_status; i++) {
         Sleep(1000);
@@ -546,30 +630,41 @@ static void pair(const StreamTarget *t, const char *uuid)
     }
     GetExitCodeProcess(proc, &code);
     CloseHandle(proc);
-    if (!pairing_id[0])
-        ui_log(L"Moonlight: no pairing request reached \"%s\"'s Sunshine (last HTTP %lu, exit %ld).",
-               t->name, get_status, (long)code);
+    if (!pairing_id[0]) {
+        if ((text = moonlight_log_since(&started)) != NULL) {
+            no_display = strstr(text, NO_DISPLAY_LOG) != NULL;
+            free(text);
+        }
+        if (no_display)
+            ui_log(L"Moonlight: cannot pair \"%s\" now: %s.", t->name, NO_DISPLAY_WHY);
+        else
+            ui_log(L"Moonlight: no pairing request reached \"%s\"'s Sunshine (last HTTP %lu, exit %ld).",
+                   t->name, get_status, (long)code);
+    }
+    return no_display;
 }
 
-typedef enum { PREP_READY, PREP_NOT_UP, PREP_FAILED } PrepResult;
+typedef enum { PREP_READY, PREP_NOT_UP, PREP_NO_DISPLAY, PREP_FAILED } PrepResult;
 
 /* Get a running VM ready to stream: both Moonlight (a certificate for the server ID Sunshine
    reports) and Sunshine (this host in its client list) hold the pairing. */
-static PrepResult prepare(const StreamTarget *t)
+static PrepResult prepare(StreamTarget *t)
 {
-    char uuid[64];
+    char *uuid = t->uuid;
     int client;
     if (!t->ip[0] || !t->password[0]) return PREP_FAILED;
     apply_firewall(t->ip);
     /* Sunshine starts at sign-in and is installed on first boot: wait until both ports answer. */
-    if (!sunshine_uniqueid(t, uuid, sizeof(uuid)) || (client = sunshine_client(t, FALSE)) < 0)
+    if (!sunshine_uniqueid(t, uuid, sizeof(t->uuid)) || (client = sunshine_client(t, FALSE)) < 0)
         return PREP_NOT_UP;
-    if (client && moonlight_paired(uuid)) return PREP_READY;
+    if (client && moonlight_paired(uuid) && !t->force) return PREP_READY;
+    if (!host_has_display()) return PREP_NO_DISPLAY;
 
-    ui_log(L"Moonlight: pairing with \"%s\" (Sunshine %S)...", t->name, uuid);
-    moonlight_forget(t->ip, uuid);
+    ui_log(L"Moonlight: pairing with \"%s\" (Sunshine %S)%s...", t->name, uuid,
+           t->force ? L" again, after a failed stream" : L"");
+    moonlight_forget(t->ip, uuid, NULL);
     if (client) sunshine_client(t, TRUE);
-    pair(t, uuid);
+    if (pair(t, uuid)) return PREP_NO_DISPLAY;
     client = sunshine_client(t, FALSE);
     if (client > 0 && moonlight_paired(uuid)) {
         ui_log(L"Moonlight: paired with \"%s\".", t->name);
@@ -592,6 +687,103 @@ static void close_slot(StreamSlot *s)   /* caller holds g_lock */
     }
 }
 
+/* Has this launch's stream started? Reads the Moonlight log created since the launch: 1 when the
+   video stream started, -1 on an error (why says which), 0 not yet. */
+static int stream_log_verdict(const StreamSlot *s, wchar_t *why, size_t why_cch)
+{
+    char *text = moonlight_log_since(&s->launched_ft), *crit;
+    int verdict = 0;
+
+    if (!text) return 0;
+    if (strstr(text, "Starting video stream") || strstr(text, "Video stream is ")) {
+        verdict = 1;
+    } else if (strstr(text, NO_DISPLAY_LOG)) {
+        swprintf_s(why, why_cch, L"%s", NO_DISPLAY_WHY);
+        verdict = -1;
+    } else if ((crit = strstr(text, "Qt Critical: ")) != NULL) {
+        char *end = strpbrk(crit, "\r\n");
+        size_t n;
+        if (end) *end = '\0';
+        n = strlen(crit);
+        while (n > 13 && (crit[n - 1] == '.' || crit[n - 1] == ' ')) crit[--n] = '\0';   /* we add our own */
+        swprintf_s(why, why_cch, L"%.160S", crit + 13);
+        verdict = -1;
+    }
+    free(text);
+    return verdict;
+}
+
+/* Why a stream that has not started yet is stuck, for the log: Moonlight waiting for one server
+   while another answers at the address. */
+static void stuck_reason(const StreamSlot *s, wchar_t *why, size_t why_cch)
+{
+    char *text, *hit;
+
+    swprintf_s(why, why_cch, L"the video did not start within %u s", STREAM_START_MS / 1000);
+    if (!(text = moonlight_log_since(&s->launched_ft))) return;
+    if ((hit = strstr(text, "Found unexpected PC ")) != NULL) {
+        char *end = strpbrk(hit, "\r\n");
+        if (end) *end = '\0';
+        swprintf_s(why, why_cch, L"the video did not start within %u s (Moonlight: %.120S)",
+                   STREAM_START_MS / 1000, hit);
+    }
+    free(text);
+}
+
+static DWORD bitrate_kbps(const VmInstance *v);
+
+/* Launch the stream for vm (caller holds g_lock; s is ready and has no running Moonlight). */
+static BOOL launch_stream(StreamSlot *s, VmInstance *vm)
+{
+    wchar_t args[256];
+    /* Moonlight finds the server by address: a record left by another VM at this address makes it
+       wait for that VM. Only this VM's record may hold the address. */
+    if (s->uuid[0]) moonlight_forget(vm->nat_ip, NULL, s->uuid);
+    /* The raw viewer may have the guest at a smaller size: back to native first. */
+    vm_agent_send(vm, "viewer_size:native", NULL, 0, 0);
+    swprintf_s(args, ARRAYSIZE(args),
+               L"stream %S Desktop --resolution %lux%lu --fps %lu --bitrate %lu "
+               L"--video-codec HEVC --display-mode fullscreen --capture-system-keys fullscreen",
+               vm->nat_ip, vm->display_width, vm->display_height, vm->display_refresh,
+               bitrate_kbps(vm));
+    s->moonlight = start_moonlight(args);
+    if (!s->moonlight) {
+        set_status(s, L"Moonlight could not be started (see the App Sandbox log)");
+        return FALSE;
+    }
+    s->launched = GetTickCount64();
+    GetSystemTimeAsFileTime(&s->launched_ft);
+    s->watching = TRUE;
+    set_status(s, L"starting the stream");
+    ui_log(L"Moonlight: streaming \"%s\" at %lux%lu@%lu, %lu kbps.", vm->name,
+           vm->display_width, vm->display_height, vm->display_refresh, bitrate_kbps(vm));
+    return TRUE;
+}
+
+/* A launched stream failed: end it, pair again from scratch, and relaunch once (caller holds
+   g_lock). */
+static void stream_failed(StreamSlot *s, const wchar_t *why)
+{
+    close_slot(s);
+    s->watching = FALSE;
+    s->ready = FALSE;
+    s->force_pair = TRUE;
+    s->next_check = 0;
+    s->pair_wait = 0;
+    wcsncpy_s(s->last_error, ARRAYSIZE(s->last_error), why, _TRUNCATE);
+    if (s->relaunches < STREAM_RELAUNCHES) {
+        s->relaunches++;
+        s->relaunch = TRUE;
+        set_status(s, L"the stream failed (%s); pairing again and retrying", why);
+        ui_log(L"Moonlight: the stream for \"%s\" failed: %s. Pairing again, then relaunching.", s->name, why);
+    } else {
+        s->relaunch = FALSE;
+        set_status(s, L"Moonlight could not stream: %s. The raw viewer still works; details in the App Sandbox log", why);
+        ui_log(L"Moonlight: the stream for \"%s\" failed again: %s. Not retrying; open it again to retry.",
+               s->name, why);
+    }
+}
+
 static DWORD WINAPI monitor_thread(LPVOID param)
 {
     ULONGLONG next_install = 0, install_wait = 30000;
@@ -599,42 +791,84 @@ static DWORD WINAPI monitor_thread(LPVOID param)
 
     while (g_running) {
         ULONGLONG now = GetTickCount64();
-        StreamTarget pending;
-        BOOL any_native = FALSE, have_pending = FALSE;
+        StreamTarget pending = { 0 };
+        BOOL any_native = FALSE, have_pending = FALSE, seen[ASB_MAX_VMS] = { 0 };
         int i, count = asb_vm_count();
 
         EnterCriticalSection(&g_lock);
         for (i = 0; i < count; i++) {
             VmInstance *v = asb_vm_instance(asb_vm_get(i));
             StreamSlot *s;
+            wchar_t why[200];
             if (!v || !v->native_display) continue;
             any_native = TRUE;
             s = slot_find(v->unique_id, TRUE);
             if (!s) continue;
+            seen[s - g_slots] = TRUE;
+            wcsncpy_s(s->name, ARRAYSIZE(s->name), v->name, _TRUNCATE);
+            if (v->nat_ip[0]) strcpy_s(s->ip, sizeof(s->ip), v->nat_ip);
+
             if (s->moonlight && WaitForSingleObject(s->moonlight, 0) == WAIT_OBJECT_0) {
                 DWORD code = 0;
                 GetExitCodeProcess(s->moonlight, &code);
-                if (now - s->launched < EARLY_EXIT_MS) {
-                    ui_log(L"Moonlight for \"%s\" exited at once (code %ld); checking pairing again.",
-                           v->name, (long)code);
-                    s->ready = FALSE;
-                }
                 CloseHandle(s->moonlight);
                 s->moonlight = NULL;
+                if (s->watching) {
+                    swprintf_s(why, ARRAYSIZE(why), L"Moonlight exited (code %ld) before the video started", (long)code);
+                    stream_failed(s, why);
+                } else if (s->ready) {
+                    set_status(s, L"ready");
+                }
+            } else if (s->moonlight && s->watching) {
+                int verdict = stream_log_verdict(s, why, ARRAYSIZE(why));
+                if (verdict > 0) {
+                    s->watching = FALSE;
+                    s->relaunches = 0;
+                    s->last_error[0] = L'\0';
+                    set_status(s, L"streaming");
+                    ui_log(L"Moonlight: \"%s\" video started.", v->name);
+                } else if (verdict < 0) {
+                    stream_failed(s, why);
+                } else if (now - s->launched >= STREAM_START_MS) {
+                    stuck_reason(s, why, ARRAYSIZE(why));
+                    stream_failed(s, why);
+                }
             }
             if (!v->running || v->shutdown_requested) {
                 if (s->moonlight) ui_log(L"Moonlight: \"%s\" is stopping, closing the stream.", v->name);
                 close_slot(s);
+                s->watching = FALSE;
+                s->relaunch = FALSE;
                 s->ready = FALSE;
                 s->next_check = 0;
                 s->pair_wait = 0;
+                set_status(s, L"the VM is not running");
                 continue;
             }
+            if (s->ready && s->relaunch && !s->moonlight) {
+                s->relaunch = FALSE;
+                ui_log(L"Moonlight: relaunching the stream for \"%s\".", v->name);
+                launch_stream(s, v);
+            }
+            if (!g_installed) set_status(s, L"installing Moonlight");
             if (!have_pending && !s->ready && v->agent_online && g_installed && now >= s->next_check) {
                 target_from(v, &pending);
+                pending.force = s->force_pair;
                 have_pending = TRUE;
                 s->next_check = now + CHECK_RETRY_MS;
             }
+        }
+        /* Slots whose VM is gone (deleted): drop its Moonlight records so its address and server
+           ID cannot be mistaken for a later VM's. */
+        for (i = 0; i < ASB_MAX_VMS; i++) {
+            StreamSlot *s = &g_slots[i];
+            if (!s->vm_id || seen[i]) continue;
+            close_slot(s);
+            if (s->ip[0] || s->uuid[0]) {
+                moonlight_forget(s->ip[0] ? s->ip : "-", s->uuid, NULL);
+                ui_log(L"Moonlight: \"%s\" no longer exists; its host records are removed.", s->name);
+            }
+            ZeroMemory(s, sizeof(*s));
         }
         LeaveCriticalSection(&g_lock);
 
@@ -648,17 +882,39 @@ static DWORD WINAPI monitor_thread(LPVOID param)
         }
 
         if (have_pending) {
-            PrepResult result = prepare(&pending);
+            PrepResult result;
+            EnterCriticalSection(&g_lock);
+            {
+                StreamSlot *s = slot_find(pending.vm_id, FALSE);
+                if (s) set_status(s, pending.force ? L"pairing again" : L"checking the pairing");
+            }
+            LeaveCriticalSection(&g_lock);
+            result = prepare(&pending);
             SecureZeroMemory(pending.password, sizeof(pending.password));
             EnterCriticalSection(&g_lock);
             {
                 StreamSlot *s = slot_find(pending.vm_id, FALSE);
+                if (s && pending.uuid[0]) strcpy_s(s->uuid, sizeof(s->uuid), pending.uuid);
                 if (s && result == PREP_READY) {
                     s->ready = TRUE;
+                    s->force_pair = FALSE;
                     s->pair_wait = 0;
+                    if (s->last_error[0] && !s->relaunch)
+                        set_status(s, L"ready; the last stream failed (%s). The raw viewer still works; "
+                                      L"details in the App Sandbox log", s->last_error);
+                    else
+                        set_status(s, L"ready");
+                } else if (s && result == PREP_NOT_UP) {
+                    set_status(s, L"waiting for Sunshine in the guest (installed on first boot, started at sign-in)");
+                } else if (s && result == PREP_NO_DISPLAY) {
+                    /* Not a pairing failure: no backoff, try again soon after a display is back. */
+                    s->next_check = GetTickCount64() + NO_DISPLAY_RETRY_MS;
+                    set_status(s, L"waiting: %s", NO_DISPLAY_WHY);
                 } else if (s && result == PREP_FAILED) {
                     s->pair_wait = s->pair_wait ? min(s->pair_wait * 2, PAIR_RETRY_MAX_MS) : PAIR_RETRY_MS;
                     s->next_check = GetTickCount64() + s->pair_wait;
+                    set_status(s, L"pairing failed; retrying in %llu s (details in the App Sandbox log)",
+                               s->pair_wait / 1000);
                     ui_log(L"Moonlight: retrying \"%s\" in %llu s.", pending.name, s->pair_wait / 1000);
                 }
             }
@@ -740,21 +996,13 @@ BOOL vm_stream_open(VmInstance *vm)
             EnumWindows(focus_window, (LPARAM)GetProcessId(s->moonlight));
             ok = TRUE;
         } else {
-            wchar_t args[256];
             if (s->moonlight) { CloseHandle(s->moonlight); s->moonlight = NULL; }
-            /* The raw viewer may have the guest at a smaller size: back to native first. */
-            vm_agent_send(vm, "viewer_size:native", NULL, 0, 0);
-            swprintf_s(args, ARRAYSIZE(args),
-                       L"stream %S Desktop --resolution %lux%lu --fps %lu --bitrate %lu "
-                       L"--video-codec HEVC --display-mode fullscreen --capture-system-keys fullscreen",
-                       vm->nat_ip, vm->display_width, vm->display_height, vm->display_refresh,
-                       bitrate_kbps(vm));
-            s->moonlight = start_moonlight(args);
-            s->launched = GetTickCount64();
-            ok = s->moonlight != NULL;
-            if (ok) ui_log(L"Moonlight: streaming \"%s\" at %lux%lu@%lu, %lu kbps.", vm->name,
-                           vm->display_width, vm->display_height, vm->display_refresh, bitrate_kbps(vm));
+            s->relaunches = 0;   /* an open by the user gets a fresh automatic retry */
+            s->relaunch = FALSE;
+            ok = launch_stream(s, vm);
         }
+    } else if (s) {
+        s->next_check = 0;   /* not ready: the user is waiting, so check again now, not after the backoff */
     }
     LeaveCriticalSection(&g_lock);
     return ok;
@@ -790,6 +1038,23 @@ void vm_stream_close(UINT64 vm_id)
     if (!g_thread) return;
     EnterCriticalSection(&g_lock);
     s = slot_find(vm_id, FALSE);
-    if (s) close_slot(s);
+    if (s) {
+        close_slot(s);
+        s->watching = FALSE;
+        s->relaunch = FALSE;
+        if (s->ready) set_status(s, L"ready");
+    }
+    LeaveCriticalSection(&g_lock);
+}
+
+void vm_stream_status(UINT64 vm_id, wchar_t *out, size_t cch)
+{
+    StreamSlot *s;
+    if (!out || !cch) return;
+    out[0] = L'\0';
+    if (!g_thread) return;
+    EnterCriticalSection(&g_lock);
+    s = slot_find(vm_id, FALSE);
+    if (s) wcscpy_s(out, cch, s->status);
     LeaveCriticalSection(&g_lock);
 }

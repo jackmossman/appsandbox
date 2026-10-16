@@ -259,6 +259,19 @@ static void build_host_info_json(JsonBuilder *jb)
             jb_object_end(jb);
         }
     }
+    {
+        const char *nat = asb_nat_subnet_base();
+        if (nat && nat[0]) {
+            wchar_t subnet[32], gateway[32];
+            swprintf_s(subnet, ARRAYSIZE(subnet), L"%S.0/24", nat);
+            swprintf_s(gateway, ARRAYSIZE(gateway), L"%S.1", nat);
+            jb_append(jb, L",\"nat\":");
+            jb_object_begin(jb);
+            jb_string(jb, L"subnet", subnet);
+            jb_string(jb, L"gateway", gateway);
+            jb_object_end(jb);
+        }
+    }
     jb_array_begin(jb, L"gpus");
     for (i = 0; gpu_list && i < gpu_list->count; i++) {
         if (i > 0) jb_append(jb, L",");
@@ -327,12 +340,20 @@ static void build_vm_json(JsonBuilder *jb, int i)
     jb_int(jb, L"sshState", (v->ssh_key_deployed && v->ssh_state == 2) ? 4 : v->ssh_state);
     jb_bool(jb, L"sshDeployKey", v->ssh_deploy_key);
     jb_bool(jb, L"sshKeyDeployed", v->ssh_key_deployed);
+    {
+        wchar_t ip[32];
+        swprintf_s(ip, ARRAYSIZE(ip), L"%S", v->nat_ip);
+        jb_string(jb, L"natIp", ip);
+        jb_string(jb, L"mac", v->mac_address);
+    }
     jb_bool(jb, L"nativeDisplay", v->native_display);
     if (v->native_display) {
-        wchar_t mode[48];
+        wchar_t mode[48], status[200];
         swprintf_s(mode, ARRAYSIZE(mode), L"%lux%lu@%lu", v->display_width, v->display_height,
                    v->display_refresh);
         jb_string(jb, L"displayMode", mode);
+        vm_stream_status(v->unique_id, status, ARRAYSIZE(status));
+        jb_string(jb, L"streamStatus", status);
     }
 
     /* Snapshot tree */

@@ -274,11 +274,19 @@ static int append_vm_json(char *out, int cap, int pos, VmInstance *v)
     pos = append_wstr(out, cap, pos, v->gpu_id);
     pos += sprintf_s(out + pos, cap - pos, ",\"gpuName\":");
     pos = append_wstr(out, cap, pos, v->gpu_name);
+    /* NAT address (allocated at create, kept across restarts; "" when not NAT) and MAC. */
+    pos += sprintf_s(out + pos, cap - pos, ",\"natIp\":\"%s\",\"mac\":", v->nat_ip);
+    pos = append_wstr(out, cap, pos, v->mac_address);
     pos += sprintf_s(out + pos, cap - pos, ",\"nativeDisplay\":%s", v->native_display ? "true" : "false");
-    if (v->native_display)
+    if (v->native_display) {
+        wchar_t status[200];
         pos += sprintf_s(out + pos, cap - pos, ",\"displayMode\":\"%lux%lu@%lu\"",
                          (unsigned long)v->display_width, (unsigned long)v->display_height,
                          (unsigned long)v->display_refresh);
+        vm_stream_status(v->unique_id, status, ARRAYSIZE(status));
+        pos += sprintf_s(out + pos, cap - pos, ",\"streamStatus\":");
+        pos = append_wstr(out, cap, pos, status);
+    }
     pos += sprintf_s(out + pos, cap - pos, "}");
     return pos;
 }
@@ -316,6 +324,11 @@ static int build_host_info(char *buf, int cap)
                 ",\"display\":{\"width\":%lu,\"height\":%lu,\"refresh\":%lu,\"widthMm\":%lu,\"heightMm\":%lu,\"scale\":%lu}",
                 (unsigned long)hd.width, (unsigned long)hd.height, (unsigned long)hd.refresh,
                 (unsigned long)hd.width_mm, (unsigned long)hd.height_mm, (unsigned long)hd.scale);
+    }
+    {
+        const char *nat = asb_nat_subnet_base();
+        if (nat && nat[0])
+            pos += sprintf_s(buf + pos, cap - pos, ",\"nat\":{\"subnet\":\"%s.0/24\",\"gateway\":\"%s.1\"}", nat, nat);
     }
     pos += sprintf_s(buf + pos, cap - pos, ",\"gpus\":[");
     for (i = 0; gpus && i < gpus->count; i++) {
@@ -1048,13 +1061,18 @@ static int handle_request(PHTTP_REQUEST req)
                    asb_vm_idd_ready: running + agent-online + the agent's latched
                    idd_status flag, so a client can poll this on an interval (it disturbs
                    nothing) and POST to open once ready. */
-                char b[200];
+                char b[1024];
+                wchar_t status[200];
+                int n;
                 BOOL open = display_is_open(v->unique_id);
                 BOOL ready = open || asb_vm_idd_ready(vm);
-                sprintf_s(b, sizeof(b), "{\"open\":%s,\"ready\":%s,\"viewer\":\"%s\",\"streamReady\":%s}",
-                          open ? "true" : "false", ready ? "true" : "false",
-                          vm_stream_is_open(v->unique_id) ? "moonlight" : raw_display_is_open(v->unique_id) ? "raw" : "none",
-                          vm_stream_is_ready(v->unique_id) ? "true" : "false");
+                n = sprintf_s(b, sizeof(b), "{\"open\":%s,\"ready\":%s,\"viewer\":\"%s\",\"streamReady\":%s,\"streamStatus\":",
+                              open ? "true" : "false", ready ? "true" : "false",
+                              vm_stream_is_open(v->unique_id) ? "moonlight" : raw_display_is_open(v->unique_id) ? "raw" : "none",
+                              vm_stream_is_ready(v->unique_id) ? "true" : "false");
+                vm_stream_status(v->unique_id, status, ARRAYSIZE(status));
+                n = append_wstr(b, (int)sizeof(b), n, status);
+                sprintf_s(b + n, sizeof(b) - n, "}");
                 send_json(req->RequestId, 200, "OK", b);
                 return 0;
             }

@@ -1087,9 +1087,10 @@ function buildRowCells(vm, i, statusTd) {
             hostBridge.isMac && vm.osType === 'Windows'
                 ? 'Windows software rendering (WARP) on the CPU'
                 : 'GPU passed through to the VM via GPU-PV, or None'),
-        makeCell(hostBridge.isMac ? 'NAT' : (netNames[vm.networkMode] || 'None'),
+        makeCell(hostBridge.isMac ? 'NAT' : (netNames[vm.networkMode] || 'None') + (vm.natIp ? ' · ' + vm.natIp : ''),
             hostBridge.isMac ? 'NAT (shared networking)'
-                : 'Networking mode: NAT (shared), External (bridged), Internal (host-only), or None'),
+                : 'Networking mode: NAT (shared), External (bridged), Internal (host-only), or None'
+                  + (vm.natIp ? '\nNAT address: ' + vm.natIp : '') + (vm.mac ? '\nMAC: ' + vm.mac : '')),
     ];
     if (!hostBridge.isMac) cells.push(makeSnapCell(vm, i));
     cells.push(
@@ -1100,6 +1101,7 @@ function buildRowCells(vm, i, statusTd) {
         makeIconCell('open-native', '\uD83D\uDDA5\uFE0F', vm.running && !bld && !!vm.nativeDisplay,
             function() { sendCmd('openNativeVm', {vmIndex: i}); }, '',
             vm.nativeDisplay ? 'Open the native display full screen (Moonlight, ' + (vm.displayMode || 'native') + ')'
+                               + (vm.streamStatus ? '\nMoonlight: ' + vm.streamStatus : '')
                              : 'Native display is off for this VM (a create-time option)'),
         sshCell,
         makeIconCell('shutdown', '\u23FB', vm.running && !bld, function() { sendCmd('shutdownVm', {vmIndex: i}); }, '', 'Request a graceful shutdown from the guest OS'),
@@ -1172,7 +1174,8 @@ function renderVmTable() {
             vm.installComplete, vm.isTemplate,
             vm.sshEnabled, vm.sshState, vm.sshPort,
             vm.osType, vm.ramMb, vm.hddGb, vm.cpuCores,
-            vm.gpuMode, vm.gpuId, vm.gpuName, vm.networkMode,
+            vm.gpuMode, vm.gpuId, vm.gpuName, vm.networkMode, vm.natIp, vm.mac,
+            vm.nativeDisplay, vm.displayMode, vm.streamStatus,
             selectedSnap.get(vm.name) || 'current',
             /* Snapshot tree: take/delete/rename/branch must trigger a row rebuild
                so makeSnapCell re-runs. These fields only change on user snapshot

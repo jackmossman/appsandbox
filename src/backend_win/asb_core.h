@@ -166,6 +166,10 @@ ASB_API const wchar_t *asb_validate_native_display(const wchar_t *os_type, BOOL 
 
 ASB_API BOOL asb_host_display(AsbHostDisplay *out);
 
+/* The NAT network's first three octets (e.g. "192.168.42"): subnet <base>.0/24, the host's
+   gateway at <base>.1, VMs from <base>.2. */
+ASB_API const char *asb_nat_subnet_base(void);
+
 /* Start a VM.
    snap_idx: snapshot index (>= 0), -2 for base, -1 for current disk.
    branch_idx: branch index (>= 0) to resume, or -1 to create a new branch.
