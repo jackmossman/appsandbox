@@ -54,6 +54,9 @@ static HANDLE        g_sunshine;            /* Sunshine we started, or NULL */
 static DWORD         g_sunshine_session = 0xFFFFFFFF;
 static SRWLOCK       g_subnet_lock = SRWLOCK_INIT;   /* g_subnet, g_new_subnet */
 static wchar_t       g_new_subnet[64];      /* from set_ip, applied by the thread; "" = none */
+static volatile LONG g_layout_now;          /* the raw viewer asked for a size: apply it next loop */
+
+#define VDD_REG_KEY         L"SOFTWARE\\AppSandbox\\VDD"
 
 /* ---- processes ---- */
 
@@ -446,20 +449,30 @@ static void apply_firewall(void)
 
 /* ---- session ---- */
 
-/* Make the App Sandbox display the only one, primary, at its mode. */
-static void apply_layout(HANDLE token)
+/* Make the App Sandbox display the only one, primary, at the raw viewer's size (registry
+   ViewerWidth/ViewerHeight, which the VDD offers as a mode) or else native. FALSE on error. */
+static BOOL apply_layout(HANDLE token)
 {
-    wchar_t exe[MAX_PATH], cmd[MAX_PATH + 32], *slash;
+    wchar_t exe[MAX_PATH], cmd[MAX_PATH + 48], size[32] = L"", *slash;
     char out[256];
-    DWORD code = 0;
+    DWORD code = 0, w = 0, h = 0, len = sizeof(DWORD);
+    HKEY key;
 
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, VDD_REG_KEY, 0, KEY_READ, &key) == ERROR_SUCCESS) {
+        if (RegGetValueW(key, NULL, L"ViewerWidth", RRF_RT_REG_DWORD, NULL, &w, &len) == ERROR_SUCCESS &&
+            (len = sizeof(DWORD), RegGetValueW(key, NULL, L"ViewerHeight", RRF_RT_REG_DWORD, NULL, &h, &len)) == ERROR_SUCCESS)
+            swprintf_s(size, 32, L" %lux%lu", w, h);
+        RegCloseKey(key);
+    }
     GetModuleFileNameW(NULL, exe, MAX_PATH);
     slash = wcsrchr(exe, L'\\');
     if (slash) *(slash + 1) = L'\0';
     wcscat_s(exe, MAX_PATH, L"appsandbox-displays.exe");
-    swprintf_s(cmd, MAX_PATH + 32, L"\"%s\" --layout", exe);
-    if (run_as_user(token, cmd, NULL, 15000, out, sizeof(out), &code, NULL) && strncmp(out, "ok ", 3) != 0)
-        LOG("Streaming: display layout: %s (exit %lu).", out[0] ? out : "(no output)", code);
+    swprintf_s(cmd, MAX_PATH + 48, L"\"%s\" --layout%s", exe, size);
+    if (!run_as_user(token, cmd, NULL, 15000, out, sizeof(out), &code, NULL)) return FALSE;
+    if (strncmp(out, "ok ", 3) != 0)
+        LOG("Streaming: display layout%ls: %s (exit %lu).", size, out[0] ? out : "(no output)", code);
+    return code == 0;
 }
 
 /* Apply Sunshine web UI credentials waiting in the registry, then delete the password. Run as
@@ -572,8 +585,12 @@ static DWORD WINAPI streaming_thread(LPVOID param)
                         last_layout = now;
                         next_start = now + RESPAWN_DELAY_MS;
                     }
-                } else if (now - last_layout >= LAYOUT_INTERVAL_MS) {
-                    apply_layout(token);
+                } else if (g_layout_now || now - last_layout >= LAYOUT_INTERVAL_MS) {
+                    /* A new raw viewer size waits for the VDD to offer it (it polls once a
+                       second), so a failed switch is retried on the next loop. */
+                    BOOL requested = InterlockedExchange(&g_layout_now, 0) != 0;
+                    if (!apply_layout(token) && requested)
+                        InterlockedExchange(&g_layout_now, 1);
                     last_layout = now;
                 }
                 CloseHandle(token);
@@ -619,6 +636,26 @@ void streaming_start(StreamLogFn log)
         LOG("Streaming: cannot start thread (%lu).", GetLastError());
     }
 #endif
+}
+
+void streaming_viewer_size(unsigned width, unsigned height)
+{
+    HKEY key;
+    if (!g_thread) return;
+    if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, VDD_REG_KEY, 0, NULL, 0, KEY_SET_VALUE, NULL, &key, NULL) != ERROR_SUCCESS)
+        return;
+    if (width && height) {
+        DWORD w = width, h = height;
+        RegSetValueExW(key, L"ViewerWidth", 0, REG_DWORD, (const BYTE *)&w, sizeof(w));
+        RegSetValueExW(key, L"ViewerHeight", 0, REG_DWORD, (const BYTE *)&h, sizeof(h));
+        LOG("Streaming: raw viewer size %ux%u.", width, height);
+    } else {
+        RegDeleteValueW(key, L"ViewerWidth");
+        RegDeleteValueW(key, L"ViewerHeight");
+        LOG("Streaming: native size (Moonlight).");
+    }
+    RegCloseKey(key);
+    InterlockedExchange(&g_layout_now, 1);
 }
 
 void streaming_network_changed(const char *ip, int prefix)

@@ -24,4 +24,8 @@ void streaming_stop(void);
    follows it. */
 void streaming_network_changed(const char *ip, int prefix);
 
+/* The host's raw viewer wants the guest at width x height (one of the VDD's modes, vdd_modes.h);
+   0 x 0 = native, for Moonlight. The VDD offers the size, then the display switches to it. */
+void streaming_viewer_size(unsigned width, unsigned height);
+
 #endif

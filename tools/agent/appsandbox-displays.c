@@ -8,8 +8,9 @@
  * Example:
  *   2,1920x1080,1024x768
  *
- * With --layout it instead makes the App Sandbox display the only active
- * display, primary, at its largest mode, and prints one line:
+ * With --layout [WxH] it instead makes the App Sandbox display the only
+ * active display, primary, at WxH (the raw viewer's size, which the driver
+ * must be offering) or else its largest mode, and prints one line:
  *   ok <W>x<H>@<Hz>          already laid out, nothing changed
  *   changed <W>x<H>@<Hz>     laid out now
  *   error <reason>
@@ -78,7 +79,7 @@ static int list_displays(void)
     return 0;
 }
 
-static int layout_displays(void)
+static int layout_displays(DWORD want_w, DWORD want_h)
 {
     DISPLAY_DEVICEW dd;
     DEVMODEW best, dm, cur;
@@ -125,6 +126,10 @@ static int layout_displays(void)
         printf("error no modes");
         return 1;
     }
+    if (want_w && want_h) {   /* the raw viewer's size, at the native refresh rate */
+        best.dmPelsWidth = want_w;
+        best.dmPelsHeight = want_h;
+    }
 
     memset(&cur, 0, sizeof(cur));
     cur.dmSize = sizeof(cur);
@@ -166,7 +171,10 @@ static int layout_displays(void)
 
 int wmain(int argc, wchar_t **argv)
 {
-    if (argc > 1 && wcscmp(argv[1], L"--layout") == 0)
-        return layout_displays();
+    if (argc > 1 && wcscmp(argv[1], L"--layout") == 0) {
+        DWORD w = 0, h = 0;
+        if (argc > 2 && swscanf_s(argv[2], L"%lux%lu", &w, &h) != 2) w = h = 0;
+        return layout_displays(w, h);
+    }
     return list_displays();
 }

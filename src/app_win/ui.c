@@ -64,7 +64,6 @@ static VmDisplayIdd *g_idd_displays[ASB_MAX_VMS];
 #define WM_VM_SHUTDOWN_TIMEOUT (WM_APP + 9)
 #define WM_PREREQ_DONE        (WM_APP + 17)
 #define WM_DISK_SPACE         (WM_APP + 19)
-#define WM_VM_STREAM_READY    (WM_APP + 20)
 
 /* Tray */
 #define TRAY_CMD_SHOW          1
@@ -116,12 +115,6 @@ static void safe_destroy_rdp(int idx)
         vm_display_disconnect(d);
         vm_display_destroy(d);
     }
-}
-
-/* vm_stream's monitor thread -> UI thread. */
-static void on_stream_ready(UINT64 vm_id)
-{
-    PostMessageW(g_hwnd_main, WM_VM_STREAM_READY, 0, (LPARAM)vm_id);
 }
 
 static void safe_destroy_idd(int idx)
@@ -700,11 +693,7 @@ static void do_connect_idd(int idx)
     if (idx < 0 || idx >= asb_vm_count()) return;
     v = asb_vm_instance(asb_vm_get(idx));
     if (!v || !v->running) { ui_log(L"VM \"%s\" is not running.", v ? v->name : L"?"); return; }
-    /* Native display VMs stream to Moonlight once it is paired; until then, the raw viewer. */
-    if (vm_stream_open(v)) {
-        safe_destroy_idd(idx);
-        return;
-    }
+    vm_stream_close(v->unique_id);   /* one viewer at a time: the raw viewer replaces Moonlight */
     if (g_idd_displays[idx] && vm_display_idd_is_open(g_idd_displays[idx])) {
         vm_display_idd_focus(g_idd_displays[idx]);
         return;
@@ -1020,7 +1009,7 @@ static void on_webview2_message(const wchar_t *json)
         }
         g_prereq_ok = TRUE;
         asb_init();
-        vm_stream_init(on_stream_ready);
+        vm_stream_init(NULL);
         send_full_state();
     } else if (wcscmp(action, L"createVm") == 0) {
         if (!g_prereq_ok) {
@@ -1152,6 +1141,22 @@ static void on_webview2_message(const wchar_t *json)
         }
     } else if (wcscmp(action, L"connectIddVm") == 0) {
         int idx; if (json_get_int(json, L"vmIndex", &idx)) do_connect_vm(idx);
+    } else if (wcscmp(action, L"openNativeVm") == 0) {
+        /* Native display VMs: Moonlight full screen at the native mode, replacing the raw viewer. */
+        int idx;
+        if (json_get_int(json, L"vmIndex", &idx) && idx >= 0 && idx < asb_vm_count()) {
+            VmInstance *v = asb_vm_instance(asb_vm_get(idx));
+            if (v && v->running && v->native_display) {
+                if (vm_stream_open(v)) {
+                    safe_destroy_idd(idx);
+                } else {
+                    wchar_t msg[400];
+                    swprintf_s(msg, ARRAYSIZE(msg), L"Moonlight isn't ready for \"%s\" yet: it is still being "
+                               L"set up or paired, which takes about a minute after the VM signs in.", v->name);
+                    ui_show_alert(msg);
+                }
+            }
+        }
     } else if (wcscmp(action, L"sshConnect") == 0) {
         int idx;
         if (json_get_int(json, L"vmIndex", &idx) && idx >= 0 && idx < asb_vm_count()) {
@@ -1584,24 +1589,6 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     }
 
-    case WM_VM_STREAM_READY:
-    {
-        /* Moonlight is paired with a native display VM: if its raw viewer is open, switch. */
-        VmInstance *inst = asb_find_vm_by_id((UINT64)lp);
-        if (inst && inst->running && !inst->shutdown_requested) {
-            int i, count = asb_vm_count();
-            for (i = 0; i < count; i++) {
-                if (asb_vm_instance(asb_vm_get(i)) != inst) continue;
-                if (g_idd_displays[i] && vm_display_idd_is_open(g_idd_displays[i])) {
-                    ui_log(L"Switching \"%s\" to Moonlight.", inst->name);
-                    do_connect_idd(i);
-                }
-                break;
-            }
-        }
-        return 0;
-    }
-
     case WM_VM_IDD_READY:
     {
         /* lp is a stable per-VM id (UINT64), not a VmInstance*. Resolve
@@ -1757,7 +1744,7 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             g_prereq_ok = TRUE;
             webview2_post(L"{\"type\":\"prereqResult\",\"ok\":true,\"reboot\":false}");
             asb_init();
-            vm_stream_init(on_stream_ready);
+            vm_stream_init(NULL);
             send_full_state();
         } else if (ok && reboot_required) {
             g_prereq_reboot_pending = TRUE;

@@ -32,6 +32,7 @@
   <ItemGroup>
     <ClInclude Include="vdd.h" />
     <ClInclude Include="vdd_edid.h" />
+    <ClInclude Include="vdd_modes.h" />
     <ClInclude Include="Trace.h" />
   </ItemGroup>
   <ItemGroup>

@@ -2128,6 +2128,16 @@ static void handle_client(AsbConn *client)
         else if (strcmp(cmd, "idd_connect") == 0) {
             handle_idd_connect(client, tag);
         }
+        else if (strncmp(cmd, "viewer_size:", 12) == 0) {
+            /* viewer_size:WxH (raw viewer) or viewer_size:native (Moonlight) */
+            unsigned w = 0, h = 0;
+            if (strcmp(cmd + 12, "native") == 0 || sscanf_s(cmd + 12, "%ux%u", &w, &h) == 2) {
+                streaming_viewer_size(w, h);
+                REPLY("ok");
+            } else {
+                REPLY("error:bad_format");
+            }
+        }
         else {
             REPLY("error:unknown");
         }

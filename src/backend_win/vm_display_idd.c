@@ -35,8 +35,10 @@
 #include "vm_clipboard.h"
 #include "vm_agent.h"
 #include "hcs_vm.h"
+#include "asb_core.h"
 #include "ui.h"
 #include "resource.h"
+#include "../../tools/vdd/vdd_modes.h"
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "d3d11.lib")
@@ -115,6 +117,7 @@ typedef struct AudioFrameHeader {
 #define WM_IDD_FOCUS            (WM_USER + 101)
 #define WM_IDD_INPUT_READY      (WM_USER + 102)
 #define WM_IDD_CURSOR_CHANGED   (WM_USER + 103)
+#define WM_IDD_FRAME_RESIZED    (WM_USER + 104)   /* frames arrived at a new size */
 
 /* Timer for Present cadence when no frames arrive */
 #define IDT_PRESENT     2001
@@ -262,6 +265,12 @@ struct VmDisplayIdd {
     HWND           log_hwnd;        /* top-level log window */
     HWND           log_list_hwnd;   /* listbox inside log window */
     HWND           render_hwnd;     /* child window for D3D11 rendering */
+
+    /* Resize to fit (native display VMs): the guest runs at the window's size, snapped to one
+       of the VDD's modes (vdd_modes.h); Moonlight is used for native. */
+    BOOL           fit_guest;
+    UINT           native_w, native_h;
+    UINT           want_w, want_h;  /* the size last asked of the guest */
 
     /* Clipboard (extracted to vm_clipboard.c) */
     VmClipboard      clipboard;
@@ -2080,6 +2089,7 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                     d->frame_stride = new_stride;
                     idd_log(d, L"Frame resolution changed: %ux%u (stride=%u)",
                             hdr.width, hdr.height, hdr.stride);
+                    if (d->hwnd) PostMessageW(d->hwnd, WM_IDD_FRAME_RESIZED, 0, 0);
                     idd_log(d, L"Resolution changed to %ux%u.", hdr.width, hdr.height);
                 } else {
                     LeaveCriticalSection(&d->frame_cs);
@@ -2213,6 +2223,33 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
  * Window thread — creates window, initializes D3D11, runs message pump
  * ================================================================== */
 
+/* Native display VMs: ask the guest to run at the largest VDD mode that fits avail_w x avail_h. */
+static void idd_request_guest_size(VmDisplayIdd *d, UINT avail_w, UINT avail_h)
+{
+    unsigned w, h;
+    char cmd[48];
+    if (!d->fit_guest || !avail_w || !avail_h) return;
+    vdd_fit_mode(d->native_w, d->native_h, avail_w, avail_h, &w, &h);
+    if (w == d->want_w && h == d->want_h) return;
+    d->want_w = w;
+    d->want_h = h;
+    d->vm->viewer_width = w;
+    d->vm->viewer_height = h;
+    asb_save();
+    sprintf_s(cmd, sizeof(cmd), "viewer_size:%ux%u", w, h);
+    vm_agent_send(d->vm, cmd, NULL, 0, 0);   /* fire-and-forget; the guest switches in ~1-3 s */
+    ui_log(L"\"%s\": raw viewer asks the guest for %ux%u (window %ux%u).", d->vm_name, w, h, avail_w, avail_h);
+}
+
+/* After the user resizes: fit the guest to the window's client area. */
+static void idd_fit_guest_to_window(VmDisplayIdd *d)
+{
+    RECT rc;
+    if (!d->fit_guest || !d->hwnd || IsIconic(d->hwnd)) return;
+    GetClientRect(d->hwnd, &rc);
+    idd_request_guest_size(d, (UINT)rc.right, (UINT)rc.bottom);
+}
+
 static DWORD WINAPI idd_window_thread_proc(LPVOID param)
 {
     VmDisplayIdd *d = (VmDisplayIdd *)param;
@@ -2223,11 +2260,12 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
 
     swprintf_s(title, 300, L"%s - IDD Display", d->vm_name);
 
-    /* Compute outer window size so the client area is exactly 1920x1080 */
+    /* Compute outer window size so the client area is exactly 1920x1080, or the guest size
+       asked for (native display VMs) */
     {
         DWORD style   = WS_OVERLAPPEDWINDOW | WS_VISIBLE | WS_CLIPCHILDREN;
         DWORD exstyle = 0;
-        RECT wr = { 0, 0, 1920, 1080 };
+        RECT wr = { 0, 0, d->fit_guest ? (LONG)d->want_w : 1920, d->fit_guest ? (LONG)d->want_h : 1080 };
         AdjustWindowRectEx(&wr, style, FALSE, exstyle);
 
         d->hwnd = CreateWindowExW(
@@ -2516,8 +2554,14 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         AdjustWindowRectEx(&wr, style, FALSE, exstyle);
         mmi->ptMinTrackSize.x = wr.right - wr.left;
         mmi->ptMinTrackSize.y = wr.bottom - wr.top;
-        /* Max: native frame size */
-        if (d && d->frame_width > 0 && d->frame_height > 0) {
+        /* Max: native frame size (the guest's native mode when it follows the window) */
+        if (d && d->fit_guest) {
+            wr.left = 0; wr.top = 0;
+            wr.right = (LONG)d->native_w; wr.bottom = (LONG)d->native_h;
+            AdjustWindowRectEx(&wr, style, FALSE, exstyle);
+            mmi->ptMaxTrackSize.x = wr.right - wr.left;
+            mmi->ptMaxTrackSize.y = wr.bottom - wr.top;
+        } else if (d && d->frame_width > 0 && d->frame_height > 0) {
             wr.left = 0; wr.top = 0;
             wr.right = (LONG)d->frame_width; wr.bottom = (LONG)d->frame_height;
             AdjustWindowRectEx(&wr, style, FALSE, exstyle);
@@ -2540,6 +2584,26 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 ReleaseSRWLockExclusive(&g_mouse_capture_lock);
             }
             idd_update_relative_mouse(d);
+            /* Maximize / restore are not drags: fit the guest now (drags fit on WM_EXITSIZEMOVE). */
+            if (!d->input_sizing && (wp == SIZE_MAXIMIZED || wp == SIZE_RESTORED))
+                idd_fit_guest_to_window(d);
+        }
+        return 0;
+
+    case WM_IDD_FRAME_RESIZED:
+        /* The guest switched to the size asked for: snap the window to it so the frame shows
+           1:1 (unless maximized, or the user is mid-drag). */
+        if (d && d->fit_guest && !IsZoomed(hwnd) && !IsIconic(hwnd) && !d->input_sizing &&
+            d->frame_width == d->want_w && d->frame_height == d->want_h) {
+            DWORD style   = (DWORD)GetWindowLongW(hwnd, GWL_STYLE);
+            DWORD exstyle = (DWORD)GetWindowLongW(hwnd, GWL_EXSTYLE);
+            RECT rc, wr = { 0, 0, (LONG)d->want_w, (LONG)d->want_h };
+            GetClientRect(hwnd, &rc);
+            if ((UINT)rc.right != d->want_w || (UINT)rc.bottom != d->want_h) {
+                AdjustWindowRectEx(&wr, style, FALSE, exstyle);
+                SetWindowPos(hwnd, NULL, 0, 0, wr.right - wr.left, wr.bottom - wr.top,
+                             SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+            }
         }
         return 0;
 
@@ -2557,6 +2621,8 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (d) {
             d->input_sizing = msg == WM_ENTERSIZEMOVE;
             idd_update_relative_mouse(d);
+            if (msg == WM_EXITSIZEMOVE)
+                idd_fit_guest_to_window(d);
         }
         break;
 
@@ -2862,6 +2928,16 @@ VmDisplayIdd *vm_display_idd_create(VmInstance *vm, HINSTANCE hInstance, HWND ma
        the default (off) if this VM doesn't have one yet. The hook itself is
        installed later, on the window thread, once the window exists. */
     d->transmit_hotkeys = idd_display_settings_load_or_create(vm->vhdx_path);
+
+    /* Native display VMs: the guest follows the window, starting at the size last used (or
+       1920x1080); Moonlight shows native. */
+    if (vm->native_display && vm->display_width && vm->display_height) {
+        d->fit_guest = TRUE;
+        d->native_w  = vm->display_width;
+        d->native_h  = vm->display_height;
+        idd_request_guest_size(d, vm->viewer_width ? vm->viewer_width : 1920,
+                               vm->viewer_height ? vm->viewer_height : 1080);
+    }
 
     /* Initialize frame buffer at default resolution */
     d->frame_width  = DEFAULT_WIDTH;

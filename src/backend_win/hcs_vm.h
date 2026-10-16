@@ -121,6 +121,7 @@ typedef struct {
     DWORD       display_width_mm, display_height_mm;
     wchar_t     stream_user[32];         /* Sunshine web UI credentials, for host-side pairing */
     wchar_t     stream_password[64];
+    DWORD       viewer_width, viewer_height;   /* raw viewer's last guest size (native display VMs) */
 } VmInstance;
 
 /* Initialize HCS - loads computecore.dll dynamically.

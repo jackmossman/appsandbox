@@ -1094,7 +1094,13 @@ function buildRowCells(vm, i, statusTd) {
     if (!hostBridge.isMac) cells.push(makeSnapCell(vm, i));
     cells.push(
         makeIconCell('start', '\u25B6\uFE0F', !vm.running && !bld, function() { onStartVm(i); }, '', 'Start the VM (boots from the selected snapshot/branch)'),
-        makeIconCell('connect-idd', '\uD83D\uDCFA', vm.running && !bld, function() { sendCmd('connectIddVm', {vmIndex: i}); }, '', 'Open the VM display window (IDD virtual monitor)'),
+        makeIconCell('connect-idd', '\uD83D\uDCFA', vm.running && !bld, function() { sendCmd('connectIddVm', {vmIndex: i}); }, '',
+            vm.nativeDisplay ? 'Open the VM display window; the guest follows the window size'
+                             : 'Open the VM display window (IDD virtual monitor)'),
+        makeIconCell('open-native', '\uD83D\uDDA5\uFE0F', vm.running && !bld && !!vm.nativeDisplay,
+            function() { sendCmd('openNativeVm', {vmIndex: i}); }, '',
+            vm.nativeDisplay ? 'Open the native display full screen (Moonlight, ' + (vm.displayMode || 'native') + ')'
+                             : 'Native display is off for this VM (a create-time option)'),
         sshCell,
         makeIconCell('shutdown', '\u23FB', vm.running && !bld, function() { sendCmd('shutdownVm', {vmIndex: i}); }, '', 'Request a graceful shutdown from the guest OS'),
         makeIconCell('stop', '\u2715\uFE0F', vm.running && !bld, function() { onStopVm(i); }, '', 'Force power off the VM immediately (may lose unsaved guest data)'),

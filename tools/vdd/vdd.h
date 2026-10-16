@@ -122,8 +122,9 @@ typedef struct _VDD_SWAP_PROC {
     ID3D11Device*       pDevice;
     ID3D11DeviceContext* pDeviceContext;
 
-    /* Staging texture for CPU readback (owned, per-swap-chain) */
+    /* Staging texture for CPU readback (owned, per-swap-chain), at the current mode's size */
     ID3D11Texture2D*    pStagingTex;
+    UINT                stagingW, stagingH;
 
     /* Host connection via asb_transport — AF_HYPERV HvSocket on a Windows host, ivshmem stream
        slot on a macOS host. One emit path, two backends. */
@@ -154,6 +155,7 @@ typedef struct _VDD_SWAP_PROC {
     PBYTE               packBuf;            /* g_mode.pixelBytes, dirty rects packed for one write */
     RECT                pendRects[VDD_MAX_DIRTY_RECTS];
     UINT                pendRectCount;
+    UINT                pendW, pendH;       /* size of the pending frame */
     BOOL                pendFull;
     BOOL                pendValid;
 } VDD_SWAP_PROC;
@@ -179,6 +181,7 @@ typedef struct _VDD_DEVICE_CONTEXT {
        Uses a WDF timer so the callback runs on a proper WDF thread
        (IddCx APIs crash when called from raw CreateThread threads). */
     WDFTIMER            hRecoveryTimer;
+    WDFTIMER            hViewerTimer;       /* polls the raw viewer's requested size */
 } VDD_DEVICE_CONTEXT;
 
 /* ============================================================================

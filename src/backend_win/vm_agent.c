@@ -58,6 +58,7 @@ typedef struct AgentConn {
 
 #define MAX_AGENTS 16
 static AgentConn g_conns[MAX_AGENTS];
+static SRWLOCK   g_send_lock = SRWLOCK_INIT;   /* vm_agent_send callers take turns on a VM's slot */
 static BOOL      g_wsa_init = FALSE;
 
 static AgentConn *find_conn(VmInstance *vm)
@@ -617,12 +618,22 @@ BOOL vm_agent_send(VmInstance *instance, const char *command,
     }
 
     /* Hand the command to the connection thread (it owns the socket and is the
-       sole sender). NOTE: this is a single slot per VM (conn->cmd), not a queue,
-       so concurrent callers for the SAME VM would clobber -- safe here because
-       per VM only one caller exists (shutdown). */
+       sole sender). There is a single slot per VM (conn->cmd), cleared when the
+       agent's reply arrives; a fire-and-forget command can still be in it when
+       the next caller comes (the raw viewer's viewer_size, then idd_connect), so
+       callers take turns: wait for the slot (normally milliseconds), then fill it. */
+    AcquireSRWLockExclusive(&g_send_lock);
+    {
+        ULONGLONG deadline = GetTickCount64() + 5000;
+        while (conn->cmd_pending && GetTickCount64() < deadline)
+            Sleep(5);
+        if (conn->cmd_pending)
+            ui_log(L"Agent: previous command to \"%s\" still pending; \"%S\" replaces it", instance->name, command);
+    }
     ResetEvent(conn->cmd_done);
     strcpy_s(conn->cmd, sizeof(conn->cmd), command);
     conn->cmd_pending = TRUE;
+    ReleaseSRWLockExclusive(&g_send_lock);
 
     /* timeout_ms == 0  =>  FIRE-AND-FORGET. Used for shutdown/restart, which ride
        the guest powering off: the agent replies "ok" then kills itself, so there

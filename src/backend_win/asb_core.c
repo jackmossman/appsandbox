@@ -810,6 +810,8 @@ static void save_vm_list(void)
             if (g_vms[i].display_width_mm && g_vms[i].display_height_mm)
                 fwprintf(f, L"DisplaySizeMm=%lux%lu\n", g_vms[i].display_width_mm,
                          g_vms[i].display_height_mm);
+            if (g_vms[i].viewer_width && g_vms[i].viewer_height)
+                fwprintf(f, L"ViewerSize=%lux%lu\n", g_vms[i].viewer_width, g_vms[i].viewer_height);
             fwprintf(f, L"StreamUser=%s\n", g_vms[i].stream_user);
             if (g_vms[i].stream_password[0]) {
                 wchar_t protected_b64[1024];
@@ -986,6 +988,10 @@ static void load_vm_list(void)
         else if (wcsncmp(line, L"DisplaySizeMm=", 14) == 0) {
             if (swscanf_s(line + 14, L"%lux%lu", &vm->display_width_mm, &vm->display_height_mm) != 2)
                 vm->display_width_mm = vm->display_height_mm = 0;
+        }
+        else if (wcsncmp(line, L"ViewerSize=", 11) == 0) {
+            if (swscanf_s(line + 11, L"%lux%lu", &vm->viewer_width, &vm->viewer_height) != 2)
+                vm->viewer_width = vm->viewer_height = 0;
         }
         else if (wcsncmp(line, L"StreamUser=", 11) == 0)
             wcsncpy_s(vm->stream_user, ARRAYSIZE(vm->stream_user), line + 11, _TRUNCATE);

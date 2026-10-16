@@ -990,13 +990,29 @@ static int handle_request(PHTTP_REQUEST req)
                              "the VM's virtual display driver is not up yet; retry shortly");
                     return 0;
                 }
-                /* Native display VMs stream to Moonlight once it is paired; until then (GET's
-                   "streamReady" false) they get the raw viewer like any other VM. */
-                if (vm_stream_open(v)) {
-                    display_drop(display_find(v->unique_id));
-                    send_json(req->RequestId, 200, "OK",
-                              "{\"ok\":true,\"displayOpen\":true,\"viewer\":\"moonlight\"}");
-                    return 0;
+                /* {"viewer":"native"}: Moonlight full screen (native display VMs, once GET's
+                   "streamReady" is true). Otherwise the raw viewer. One viewer at a time. */
+                {
+                    wchar_t body[256] = L"", viewer[16] = L"";
+                    if (body_to_wide(req, body, ARRAYSIZE(body)))
+                        json_get_string(body, L"viewer", viewer, ARRAYSIZE(viewer));
+                    if (_wcsicmp(viewer, L"native") == 0) {
+                        if (!v->native_display) {
+                            send_err(req->RequestId, 409, "Conflict", "not_native",
+                                     "the VM was not created with the native display option");
+                            return 0;
+                        }
+                        if (!vm_stream_open(v)) {
+                            send_err(req->RequestId, 409, "Conflict", "stream_not_ready",
+                                     "Moonlight is not paired with the VM yet; retry when GET shows streamReady");
+                            return 0;
+                        }
+                        display_drop(display_find(v->unique_id));
+                        send_json(req->RequestId, 200, "OK",
+                                  "{\"ok\":true,\"displayOpen\":true,\"viewer\":\"moonlight\"}");
+                        return 0;
+                    }
+                    vm_stream_close(v->unique_id);
                 }
                 e = display_find(v->unique_id);   /* present => still open (a closed one was reaped above) */
                 if (e) {

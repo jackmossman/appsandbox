@@ -23,6 +23,7 @@
 #include <string.h>
 #include "vm_stream.h"
 #include "asb_core.h"
+#include "vm_agent.h"
 #include "ui.h"
 
 #pragma comment(lib, "winhttp.lib")
@@ -741,6 +742,8 @@ BOOL vm_stream_open(VmInstance *vm)
         } else {
             wchar_t args[256];
             if (s->moonlight) { CloseHandle(s->moonlight); s->moonlight = NULL; }
+            /* The raw viewer may have the guest at a smaller size: back to native first. */
+            vm_agent_send(vm, "viewer_size:native", NULL, 0, 0);
             swprintf_s(args, ARRAYSIZE(args),
                        L"stream %S Desktop --resolution %lux%lu --fps %lu --bitrate %lu "
                        L"--video-codec HEVC --display-mode fullscreen --capture-system-keys fullscreen",
