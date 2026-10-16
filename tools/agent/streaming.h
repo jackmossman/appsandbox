@@ -12,11 +12,13 @@
 
 typedef void (*StreamLogFn)(const char *fmt, ...);
 
-/* Reads the configuration and, when enabled, starts the thread that installs Sunshine and keeps
-   it running in the signed-in user's session. */
+/* Reads the configuration. When the VDD has a mode (HKLM\SOFTWARE\AppSandbox\VDD Width, every
+   Windows VM created with one), starts the thread that keeps the display at the raw viewer's
+   size; when streaming is enabled, also the thread that installs Sunshine and keeps it running
+   in the signed-in user's session. */
 void streaming_start(StreamLogFn log);
 
-/* Stops that thread and Sunshine (service stop and OS shutdown). */
+/* Stops those threads and Sunshine (service stop and OS shutdown). */
 void streaming_stop(void);
 
 /* The host assigned the guest ip/prefix (set_ip). The NAT subnet can differ from the one written

@@ -306,7 +306,8 @@ static BOOL unprotect_secret(const wchar_t *b64, wchar_t *plain, size_t cch)
     return ok;
 }
 
-/* The guest-side native display settings for SetupComplete.cmd; strings point into b. */
+/* The guest-side display settings for SetupComplete.cmd (every Windows VM with a display mode;
+   the Sunshine settings only for native display); NULL without a mode. Strings point into b. */
 typedef struct {
     AsbNativeDisplayProvision nd;
     char subnet[32];
@@ -318,15 +319,21 @@ static const AsbNativeDisplayProvision *native_display_provision(const VmConfig 
                                                                  NativeDisplayProvisionBuf *b)
 {
     ZeroMemory(b, sizeof(*b));
-    if (!cfg->native_display) return NULL;
-    sprintf_s(b->subnet, sizeof(b->subnet), "%s.0/24", hcn_nat_subnet_base());
-    WideCharToMultiByte(CP_UTF8, 0, cfg->stream_user, -1, b->user, sizeof(b->user), NULL, NULL);
-    WideCharToMultiByte(CP_UTF8, 0, cfg->stream_password, -1, b->password, sizeof(b->password), NULL, NULL);
+    if (!cfg->display_width || !cfg->display_height) return NULL;
     b->nd.width = cfg->display_width;
     b->nd.height = cfg->display_height;
     b->nd.refresh = cfg->display_refresh;
     b->nd.width_mm = cfg->display_width_mm;
     b->nd.height_mm = cfg->display_height_mm;
+    if (!cfg->native_display) {
+        /* Start at the raw viewer's default size rather than the whole host monitor. */
+        b->nd.viewer_width = VIEWER_DEFAULT_WIDTH;
+        b->nd.viewer_height = VIEWER_DEFAULT_HEIGHT;
+        return &b->nd;
+    }
+    sprintf_s(b->subnet, sizeof(b->subnet), "%s.0/24", hcn_nat_subnet_base());
+    WideCharToMultiByte(CP_UTF8, 0, cfg->stream_user, -1, b->user, sizeof(b->user), NULL, NULL);
+    WideCharToMultiByte(CP_UTF8, 0, cfg->stream_password, -1, b->password, sizeof(b->password), NULL, NULL);
     b->nd.scale = cfg->display_scale;
     b->nd.allowed_subnet = b->subnet;
     b->nd.user = b->user;
@@ -824,17 +831,19 @@ static void save_vm_list(void)
             fwprintf(f, L"InstallComplete=1\n");
         if (g_vms[i].auto_start)
             fwprintf(f, L"AutoStart=1\n");
-        if (g_vms[i].native_display) {
-            fwprintf(f, L"NativeDisplay=1\n");
+        if (g_vms[i].display_width && g_vms[i].display_height) {
             fwprintf(f, L"DisplayMode=%lux%lu@%lu\n", g_vms[i].display_width,
                      g_vms[i].display_height, g_vms[i].display_refresh);
             if (g_vms[i].display_width_mm && g_vms[i].display_height_mm)
                 fwprintf(f, L"DisplaySizeMm=%lux%lu\n", g_vms[i].display_width_mm,
                          g_vms[i].display_height_mm);
-            if (g_vms[i].display_scale)
-                fwprintf(f, L"DisplayScale=%lu\n", g_vms[i].display_scale);
             if (g_vms[i].viewer_width && g_vms[i].viewer_height)
                 fwprintf(f, L"ViewerSize=%lux%lu\n", g_vms[i].viewer_width, g_vms[i].viewer_height);
+        }
+        if (g_vms[i].native_display) {
+            fwprintf(f, L"NativeDisplay=1\n");
+            if (g_vms[i].display_scale)
+                fwprintf(f, L"DisplayScale=%lu\n", g_vms[i].display_scale);
             fwprintf(f, L"StreamUser=%s\n", g_vms[i].stream_user);
             if (g_vms[i].stream_password[0]) {
                 wchar_t protected_b64[1024];
@@ -3492,7 +3501,6 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
     if (config->native_display) {
         AsbHostDisplay host;
         cfg.native_display = TRUE;
-        cfg.test_mode = TRUE;   /* the VDD build with configurable modes is test-signed */
         native_display_mode(config->display_width, config->display_height, config->display_refresh,
                             &cfg.display_width, &cfg.display_height, &cfg.display_refresh);
         /* Streamed full screen to the host monitor, so the guest gets that monitor's size (DPI)
@@ -3509,6 +3517,21 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
         }
         asb_log(L"Native display: %lux%lu@%lu, %lux%lu mm, %lu%% scaling.", cfg.display_width, cfg.display_height,
                 cfg.display_refresh, cfg.display_width_mm, cfg.display_height_mm, cfg.display_scale);
+    } else if (!is_template_create && effective_os && _wcsicmp(effective_os, L"Windows") == 0) {
+        /* Other Windows VMs: the VDD's mode is the host monitor's size at 60 Hz, so the raw viewer
+           can size the guest to its window up to full screen. Hosts beyond the VDD's limits keep
+           the stock 1920x1080 mode. */
+        AsbHostDisplay host;
+        if (asb_host_display(&host) && host.width >= NATIVE_MIN_WIDTH && host.height >= NATIVE_MIN_HEIGHT &&
+            (ULONGLONG)host.width * host.height <= NATIVE_MAX_PIXELS) {
+            cfg.display_width = host.width;
+            cfg.display_height = host.height;
+            cfg.display_refresh = 60;
+            cfg.display_width_mm = host.width_mm;
+            cfg.display_height_mm = host.height_mm;
+            asb_log(L"Display: up to %lux%lu@60, %lux%lu mm.", cfg.display_width, cfg.display_height,
+                    cfg.display_width_mm, cfg.display_height_mm);
+        }
     }
 
     /* Defaults */

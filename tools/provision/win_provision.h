@@ -42,20 +42,23 @@ int asb_provision_login_setup(FILE *f);
  * ssh_msi_name is the basename of the MSI staged into \Windows\AppSandbox\. */
 int asb_provision_setupcomplete(FILE *f, const char *ssh_msi_name);
 
-/* Native display option: the VDD's mode and the agent's Sunshine settings, written to the guest
- * registry before the VDD is installed (the driver reads its mode when the device starts). */
+/* The VDD's mode (every Windows VM with one: the raw viewer resizes the guest within it) and, for
+ * the native display option, the agent's Sunshine settings. Written to the guest registry before
+ * the VDD is installed (the driver reads its mode when the device starts). */
 typedef struct {
     unsigned    width, height, refresh;     /* HKLM\SOFTWARE\AppSandbox\VDD */
     unsigned    width_mm, height_mm;        /* EDID physical size; 0 = derived by the driver */
+    unsigned    viewer_width, viewer_height;/* VDD ViewerWidth/ViewerHeight, the size to start at; 0 = native */
     unsigned    scale;                      /* Streaming\Scale, guest scaling in percent; 0 = Windows' choice */
-    const char *allowed_subnet;             /* HKLM\SOFTWARE\AppSandbox\Streaming, e.g. "192.168.42.0/24" */
+    const char *allowed_subnet;             /* HKLM\SOFTWARE\AppSandbox\Streaming, e.g. "192.168.42.0/24";
+                                               NULL = no streaming (scale, user and password unused) */
     const char *user, *password;            /* Sunshine web UI credentials, letters and digits only */
 } AsbNativeDisplayProvision;
 
 /* The reg add lines for nd (SetupComplete.cmd syntax, logging to %LOG%). */
 int asb_provision_native_display(FILE *f, const AsbNativeDisplayProvision *nd);
 
-/* asb_provision_setupcomplete, plus the native display settings when nd is non-NULL. */
+/* asb_provision_setupcomplete, plus the display (and streaming) settings when nd is non-NULL. */
 int asb_provision_setupcomplete_ex(FILE *f, const char *ssh_msi_name, const AsbNativeDisplayProvision *nd);
 
 #ifdef __cplusplus

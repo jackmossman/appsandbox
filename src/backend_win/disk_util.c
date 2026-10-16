@@ -1511,7 +1511,7 @@ static void stage_agent_and_setup(const wchar_t *staging, const wchar_t *res_dir
                picks up the mode just written. */
             if (native_display)
                 fputs(
-                    "echo [NATIVE] Restarting the VDD for the new mode... >> \"%LOG%\"\r\n"
+                    "echo [DISPLAY] Restarting the VDD for the new mode... >> \"%LOG%\"\r\n"
                     "\"%ISODRV%\\drivers\\devcon.exe\" restart Root\\AppSandboxVDD >> \"%LOG%\" 2>&1\r\n"
                     "\r\n",
                     sc);

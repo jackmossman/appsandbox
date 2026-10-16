@@ -296,8 +296,8 @@ int asb_provision_setup_cmd(FILE *f) {
 int asb_provision_native_display(FILE *f, const AsbNativeDisplayProvision *nd) {
     if (!f || !nd) return -1;
     fprintf(f,
-        "REM ---- Native display: VDD mode (read when the device starts) and Sunshine settings for the agent\r\n"
-        "echo [NATIVE] Display %ux%u@%u >> \"%%LOG%%\"\r\n"
+        "REM ---- Display: VDD mode (read when the device starts); Sunshine settings for native display\r\n"
+        "echo [DISPLAY] Mode %ux%u@%u >> \"%%LOG%%\"\r\n"
         "reg add HKLM\\SOFTWARE\\AppSandbox\\VDD /v Width /t REG_DWORD /d %u /f >> \"%%LOG%%\" 2>&1\r\n"
         "reg add HKLM\\SOFTWARE\\AppSandbox\\VDD /v Height /t REG_DWORD /d %u /f >> \"%%LOG%%\" 2>&1\r\n"
         "reg add HKLM\\SOFTWARE\\AppSandbox\\VDD /v RefreshRate /t REG_DWORD /d %u /f >> \"%%LOG%%\" 2>&1\r\n",
@@ -307,6 +307,15 @@ int asb_provision_native_display(FILE *f, const AsbNativeDisplayProvision *nd) {
             "reg add HKLM\\SOFTWARE\\AppSandbox\\VDD /v WidthMm /t REG_DWORD /d %u /f >> \"%%LOG%%\" 2>&1\r\n"
             "reg add HKLM\\SOFTWARE\\AppSandbox\\VDD /v HeightMm /t REG_DWORD /d %u /f >> \"%%LOG%%\" 2>&1\r\n",
             nd->width_mm, nd->height_mm);
+    if (nd->viewer_width && nd->viewer_height)
+        fprintf(f,
+            "reg add HKLM\\SOFTWARE\\AppSandbox\\VDD /v ViewerWidth /t REG_DWORD /d %u /f >> \"%%LOG%%\" 2>&1\r\n"
+            "reg add HKLM\\SOFTWARE\\AppSandbox\\VDD /v ViewerHeight /t REG_DWORD /d %u /f >> \"%%LOG%%\" 2>&1\r\n",
+            nd->viewer_width, nd->viewer_height);
+    if (!nd->allowed_subnet) {
+        fputs("\r\n", f);
+        return ferror(f) ? -1 : 0;
+    }
     if (nd->scale)
         fprintf(f,
             "reg add HKLM\\SOFTWARE\\AppSandbox\\Streaming /v Scale /t REG_DWORD /d %u /f >> \"%%LOG%%\" 2>&1\r\n",
@@ -317,8 +326,7 @@ int asb_provision_native_display(FILE *f, const AsbNativeDisplayProvision *nd) {
         "reg add HKLM\\SOFTWARE\\AppSandbox\\Streaming /v User /t REG_SZ /d %s /f >> \"%%LOG%%\" 2>&1\r\n"
         "reg add HKLM\\SOFTWARE\\AppSandbox\\Streaming /v Password /t REG_SZ /d %s /f >> \"%%LOG%%\" 2>&1\r\n"
         "\r\n",
-        nd->allowed_subnet ? nd->allowed_subnet : "",
-        nd->user ? nd->user : "", nd->password ? nd->password : "");
+        nd->allowed_subnet, nd->user ? nd->user : "", nd->password ? nd->password : "");
     return ferror(f) ? -1 : 0;
 }
 

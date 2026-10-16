@@ -124,7 +124,7 @@ function applyOsTypeUI() {
     revalidateVmName();
     revalidateUsername();
     revalidatePassword();
-    onNativeDisplayToggle();   /* hides the mode row and releases Test Mode/NAT off Windows */
+    onNativeDisplayToggle();   /* hides the mode row and releases NAT off Windows */
 }
 
 /* Unified dispatch. Native code on either platform calls
@@ -671,22 +671,18 @@ function nativeDisplayOn() {
         document.getElementById('native-display').checked;
 }
 
-/* Native display needs Test Mode (test-signed display driver) and NAT (Sunshine is reachable
-   from the host only over the NAT subnet), so it holds both while on. The core enforces the
-   same rules; this keeps the form honest. */
+/* Native display needs NAT (Sunshine is reachable from the host only over the NAT subnet), so
+   it holds it while on. The core enforces the same rule; this keeps the form honest. */
 function onNativeDisplayToggle() {
     var on = nativeDisplayOn();
     var rows = document.querySelectorAll('.native-display-row');
     for (var i = 0; i < rows.length; i++) rows[i].style.display = on ? '' : 'none';
-    var test = document.getElementById('test-mode');
     var net = document.getElementById('net-mode');
     if (on) {
-        test.checked = true;
         net.value = '1';
         if (selectedGpu('gpu-mode').gpuMode === 0) setGpuSelection('gpu-mode', { gpuMode: 1 });
         onNetModeChange();
     }
-    test.disabled = on;
     net.disabled = on;
     updateCreateButtons();
 }

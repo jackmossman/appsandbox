@@ -261,7 +261,7 @@ struct VmDisplayIdd {
     HWND           log_list_hwnd;   /* listbox inside log window */
     HWND           render_hwnd;     /* child window for D3D11 rendering */
 
-    /* Resize to fit (native display VMs): the guest runs at the window's size, snapped to one
+    /* Resize to fit (VMs with a display mode): the guest runs at the window's size, snapped to one
        of the VDD's modes (vdd_modes.h); Moonlight is used for native. */
     BOOL           fit_guest;
     UINT           native_w, native_h;
@@ -303,7 +303,7 @@ static const wchar_t *IDD_LOG_CLASS     = L"AppSandboxIddLog";
 #define IDM_AUDIO_MUTE     0x1000
 #define IDM_XMIT_HOTKEYS   0x1010
 #define IDM_SHOW_LOG       0x1020
-#define IDM_GUEST_DEFAULT     0x1030   /* native display VMs: back to the default 1920x1080 */
+#define IDM_GUEST_DEFAULT     0x1030   /* VMs with a display mode: back to the default 1920x1080 */
 static BOOL g_idd_class_registered;
 static WNDPROC g_orig_listbox_proc;
 static SRWLOCK g_mouse_capture_lock = SRWLOCK_INIT;
@@ -2212,7 +2212,7 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
  * Window thread — creates window, initializes D3D11, runs message pump
  * ================================================================== */
 
-/* Native display VMs: ask the guest to run at the largest VDD mode that fits avail_w x avail_h. */
+/* VMs with a display mode: ask the guest to run at the largest VDD mode that fits avail_w x avail_h. */
 static void idd_send_guest_size(VmDisplayIdd *d)
 {
     char cmd[48];
@@ -2277,7 +2277,7 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
     swprintf_s(title, 300, L"%s - IDD Display", d->vm_name);
 
     /* Compute outer window size so the client area is exactly 1920x1080, or the guest size
-       asked for (native display VMs) */
+       asked for (VMs with a display mode) */
     {
         DWORD style   = WS_OVERLAPPEDWINDOW | WS_VISIBLE | WS_CLIPCHILDREN;
         DWORD exstyle = 0;
@@ -2476,7 +2476,7 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             DWORD exstyle = (DWORD)GetWindowLongW(hwnd, GWL_EXSTYLE);
             RECT wr;
             if (IsZoomed(hwnd) || IsIconic(hwnd)) ShowWindow(hwnd, SW_RESTORE);
-            idd_request_guest_size(d, 1920, 1080);
+            idd_request_guest_size(d, VIEWER_DEFAULT_WIDTH, VIEWER_DEFAULT_HEIGHT);
             wr.left = 0; wr.top = 0; wr.right = (LONG)d->want_w; wr.bottom = (LONG)d->want_h;
             AdjustWindowRectEx(&wr, style, FALSE, exstyle);
             SetWindowPos(hwnd, NULL, 0, 0, wr.right - wr.left, wr.bottom - wr.top,
@@ -2968,14 +2968,14 @@ VmDisplayIdd *vm_display_idd_create(VmInstance *vm, HINSTANCE hInstance, HWND ma
        installed later, on the window thread, once the window exists. */
     d->transmit_hotkeys = idd_display_settings_load_or_create(vm->vhdx_path);
 
-    /* Native display VMs: the guest follows the window, starting at the size last used (or
-       1920x1080); Moonlight shows native. */
-    if (vm->native_display && vm->display_width && vm->display_height) {
+    /* VMs with a display mode: the guest follows the window, up to that mode, starting at the
+       size last used (or the default); Moonlight shows native display VMs at the full mode. */
+    if (vm->display_width && vm->display_height) {
         d->fit_guest = TRUE;
         d->native_w  = vm->display_width;
         d->native_h  = vm->display_height;
-        idd_request_guest_size(d, vm->viewer_width ? vm->viewer_width : 1920,
-                               vm->viewer_height ? vm->viewer_height : 1080);
+        idd_request_guest_size(d, vm->viewer_width ? vm->viewer_width : VIEWER_DEFAULT_WIDTH,
+                               vm->viewer_height ? vm->viewer_height : VIEWER_DEFAULT_HEIGHT);
     }
 
     /* Initialize frame buffer at default resolution */

@@ -44,7 +44,8 @@
 #define LOG(...) do { if (g_log) g_log(__VA_ARGS__); } while (0)
 
 static StreamLogFn   g_log;
-static HANDLE        g_thread;
+static HANDLE        g_thread;              /* Sunshine (native display VMs) */
+static HANDLE        g_layout_thread;       /* display layout (VMs whose VDD has a mode) */
 static volatile BOOL g_running;
 static wchar_t       g_subnet[64];
 static wchar_t       g_base[MAX_PATH];      /* %ProgramData%\AppSandbox */
@@ -492,7 +493,7 @@ static BOOL apply_layout(HANDLE token, BOOL *native)
     swprintf_s(cmd, MAX_PATH + 48, L"\"%s\" --layout%s", exe, size);
     if (!run_as_user(token, cmd, NULL, 15000, out, sizeof(out), &code, NULL)) return FALSE;
     if (strncmp(out, "ok ", 3) != 0)
-        LOG("Streaming: display layout%ls: %s (exit %lu).", size, out[0] ? out : "(no output)", code);
+        LOG("Display: layout%ls: %s (exit %lu).", size, out[0] ? out : "(no output)", code);
     return code == 0;
 }
 
@@ -519,7 +520,7 @@ static void apply_scale_default(HANDLE token)
     if (!run_as_user(token, cmd, NULL, 15000, out, sizeof(out), &code, NULL)) return;
     if (code == 0) g_scale_done = TRUE;
     if (strcmp(out, "kept") != 0)
-        LOG("Streaming: display scaling default %lu%%: %s (exit %lu).", scale, out[0] ? out : "(no output)", code);
+        LOG("Display: scaling default %lu%%: %s (exit %lu).", scale, out[0] ? out : "(no output)", code);
 }
 
 /* Apply Sunshine web UI credentials waiting in the registry, then delete the password. Run as
@@ -562,9 +563,48 @@ static void start_sunshine(HANDLE token, DWORD session)
     }
 }
 
+/* Display layout, on every VM whose VDD has a mode (not only native display ones): while someone
+   is signed in, keep the App Sandbox display the only one, at the raw viewer's size or native,
+   applying a new viewer size as soon as it is asked for and re-checking every minute. */
+static DWORD WINAPI layout_thread(LPVOID param)
+{
+    ULONGLONG last_layout = 0;
+    DWORD last_session = 0xFFFFFFFF;
+    (void)param;
+
+    LOG("Display: following the raw viewer's size.");
+    while (g_running) {
+        ULONGLONG now = GetTickCount64();
+        DWORD session = WTSGetActiveConsoleSessionId();
+        HANDLE token = NULL;
+
+        if (session != 0xFFFFFFFF && WTSQueryUserToken(session, &token)) {
+            if (session != last_session || g_layout_now || now - last_layout >= LAYOUT_INTERVAL_MS) {
+                /* A new raw viewer size waits for the VDD to offer it (it polls once a second),
+                   so a failed switch is retried on the next loop. */
+                BOOL requested = InterlockedExchange(&g_layout_now, 0) != 0, native;
+                if (!apply_layout(token, &native)) {
+                    if (requested) InterlockedExchange(&g_layout_now, 1);
+                } else if (native) {
+                    apply_scale_default(token);
+                }
+                last_session = session;
+                last_layout = now;
+            }
+            CloseHandle(token);
+        } else {
+            last_session = 0xFFFFFFFF;
+        }
+
+        for (int i = 0; i < 4 && g_running; i++)
+            Sleep(500);
+    }
+    return 0;
+}
+
 static DWORD WINAPI streaming_thread(LPVOID param)
 {
-    ULONGLONG next_install = 0, install_wait = 30000, next_start = 0, last_layout = 0;
+    ULONGLONG next_install = 0, install_wait = 30000, next_start = 0;
     BOOL ready;
     (void)param;
 
@@ -626,25 +666,11 @@ static DWORD WINAPI streaming_thread(LPVOID param)
                         g_sunshine = NULL;
                     }
                     if (now >= next_start) {
-                        BOOL native;
                         apply_transparency_default(token);
-                        if (apply_layout(token, &native) && native)
-                            apply_scale_default(token);
                         apply_credentials(token);
                         start_sunshine(token, session);
-                        last_layout = now;
                         next_start = now + RESPAWN_DELAY_MS;
                     }
-                } else if (g_layout_now || now - last_layout >= LAYOUT_INTERVAL_MS) {
-                    /* A new raw viewer size waits for the VDD to offer it (it polls once a
-                       second), so a failed switch is retried on the next loop. */
-                    BOOL requested = InterlockedExchange(&g_layout_now, 0) != 0, native;
-                    if (!apply_layout(token, &native)) {
-                        if (requested) InterlockedExchange(&g_layout_now, 1);
-                    } else if (native) {
-                        apply_scale_default(token);
-                    }
-                    last_layout = now;
                 }
                 CloseHandle(token);
             }
@@ -661,10 +687,19 @@ static DWORD WINAPI streaming_thread(LPVOID param)
 
 void streaming_start(StreamLogFn log)
 {
-    DWORD enabled = 0, size = sizeof(enabled);
+    DWORD enabled = 0, width = 0, size = sizeof(enabled);
     HKEY key;
 
     g_log = log;
+    if (RegGetValueW(HKEY_LOCAL_MACHINE, VDD_REG_KEY, L"Width", RRF_RT_REG_DWORD, NULL, &width, &size) ==
+            ERROR_SUCCESS && width) {
+        g_running = TRUE;
+        g_layout_thread = CreateThread(NULL, 0, layout_thread, NULL, 0, NULL);
+        if (!g_layout_thread)
+            LOG("Display: cannot start the layout thread (%lu).", GetLastError());
+    }
+
+    size = sizeof(enabled);
     if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, STREAM_REG_KEY, 0, KEY_READ, &key) != ERROR_SUCCESS)
         return;
     RegGetValueW(key, NULL, L"Enabled", RRF_RT_REG_DWORD, NULL, &enabled, &size);
@@ -684,17 +719,15 @@ void streaming_start(StreamLogFn log)
 
     g_running = TRUE;
     g_thread = CreateThread(NULL, 0, streaming_thread, NULL, 0, NULL);
-    if (!g_thread) {
-        g_running = FALSE;
+    if (!g_thread)
         LOG("Streaming: cannot start thread (%lu).", GetLastError());
-    }
 #endif
 }
 
 void streaming_viewer_size(unsigned width, unsigned height)
 {
     HKEY key;
-    if (!g_thread) return;
+    if (!g_layout_thread) return;
     if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, VDD_REG_KEY, 0, NULL, 0, KEY_SET_VALUE, NULL, &key, NULL) != ERROR_SUCCESS)
         return;
     if (width && height) {
@@ -731,9 +764,15 @@ void streaming_network_changed(const char *ip, int prefix)
 
 void streaming_stop(void)
 {
-    if (!g_thread) return;
     g_running = FALSE;
-    WaitForSingleObject(g_thread, 15000);
-    CloseHandle(g_thread);
-    g_thread = NULL;
+    if (g_layout_thread) {
+        WaitForSingleObject(g_layout_thread, 15000);
+        CloseHandle(g_layout_thread);
+        g_layout_thread = NULL;
+    }
+    if (g_thread) {
+        WaitForSingleObject(g_thread, 15000);
+        CloseHandle(g_thread);
+        g_thread = NULL;
+    }
 }

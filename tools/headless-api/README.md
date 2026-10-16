@@ -351,7 +351,7 @@ rather than forwarding bad input to the core.
 | `sshEnabled` | provision SSH + forward a loopback port |
 | `sshDeployKey` | deploy the AppSandbox public key for password-less login (**requires `sshEnabled`**; rejected `400` otherwise) |
 | `isTemplate` | build a template (Windows only; can't be built from another template) |
-| `nativeDisplay` | Windows host only: stream the guest at the host monitor's mode through Sunshine + Moonlight (see [Native display](#native-display)). Needs a Windows guest that isn't a template, `networkMode` `1` (NAT) and a GPU; turns on `testMode`. |
+| `nativeDisplay` | Windows host only: stream the guest at the host monitor's mode through Sunshine + Moonlight (see [Native display](#native-display)). Needs a Windows guest that isn't a template, `networkMode` `1` (NAT) and a GPU. |
 | `displayWidth`, `displayHeight`, `displayRefresh` | the native display mode; `0` or omitted = the host's primary monitor (`GET /host` → `display`). At most 5120×2160 pixels, 30–240 Hz. |
 | `autoStart` | start the VM when the GUI or daemon opens ("Start on Open"); not for templates. Also editable while stopped. |
 

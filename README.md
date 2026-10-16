@@ -94,9 +94,8 @@ this option streams instead: the guest's display driver offers the monitor's mod
 the screen, and [Moonlight](https://github.com/moonlight-stream/moonlight-qt) on the host shows
 it full screen. App Sandbox installs both, pairs them, and opens Moonlight from the VM's
 *Native* column, the tray's "Connect to native", or the headless API. It needs a Windows guest
-(built from an ISO or from a template, but not a template itself), NAT networking and a GPU,
-and it turns on Test Mode, because the display driver that takes a configurable mode is
-test-signed. Measured on a Radeon RX 9070 XT: 100–118 fps at 5120×2160@120 over HEVC. The raw
+(built from an ISO or from a template, but not a template itself), NAT networking and a GPU.
+Measured on a Radeon RX 9070 XT: 100–118 fps at 5120×2160@120 over HEVC. The raw
 viewer stays available for every VM and resizes the guest to its window; use it for elevated
 windows (UAC prompts, Task Manager), which Moonlight's mouse can't reach because Sunshine runs
 at standard privileges. Sunshine and Moonlight are GPL-3.0 and are downloaded at a pinned
@@ -123,6 +122,8 @@ apps are native C / Objective-C with an HTML/JS UI (WebView2 on Windows, WKWebVi
 The default username is `user` and the default password is `test123`
 
 [Windows] Enable hotkeys or mute the VM audio: connect to the VM and right-click the connection title bar  
+
+[Windows] The connection window resizes a Windows VM's screen to fit it, up to your monitor's size; "Resize to default" in its title-bar menu goes back to 1920 × 1080. This applies to VMs created with 0.1.10 or later.  
 
 [Windows] Need a high performance remote desktop to remotely access your VM? [Phaze](https://phaze.app) works well  
 

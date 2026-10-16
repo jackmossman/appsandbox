@@ -49,8 +49,8 @@ typedef struct {
     BOOL    ssh_enabled;             /* TRUE = install OpenSSH Server in guest */
     BOOL    ssh_deploy_key;          /* TRUE = deploy the AppSandbox public key (needs ssh_enabled) */
     BOOL    auto_start;              /* TRUE = start when App Sandbox opens (see asb_vm_should_auto_start) */
-    BOOL    native_display;          /* TRUE = VDD at display_* + Sunshine in the guest (see asb_core.h) */
-    DWORD   display_width, display_height, display_refresh;
+    BOOL    native_display;          /* TRUE = Sunshine in the guest, streamed at display_* (see asb_core.h) */
+    DWORD   display_width, display_height, display_refresh;   /* the VDD's mode; 0 = stock 1920x1080 */
     DWORD   display_width_mm, display_height_mm;   /* host monitor's physical size; 0 = unknown */
     DWORD   display_scale;           /* host monitor's scaling in percent, for the guest; 0 = unknown */
     wchar_t stream_user[32];         /* Sunshine web UI credentials, generated at create */
@@ -125,8 +125,12 @@ typedef struct {
     DWORD       display_scale;
     wchar_t     stream_user[32];         /* Sunshine web UI credentials, for host-side pairing */
     wchar_t     stream_password[64];
-    DWORD       viewer_width, viewer_height;   /* raw viewer's last guest size (native display VMs) */
+    DWORD       viewer_width, viewer_height;   /* raw viewer's last guest size (VMs with a display mode) */
 } VmInstance;
+
+/* The raw viewer's guest size until one is saved (VMs with a display mode). */
+#define VIEWER_DEFAULT_WIDTH    1920
+#define VIEWER_DEFAULT_HEIGHT   1080
 
 /* Initialize HCS - loads computecore.dll dynamically.
    Returns TRUE if HCS is available. */
