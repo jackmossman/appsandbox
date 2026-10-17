@@ -15,7 +15,7 @@ Windows features:
 - GPU Hardware Video Decoder/Encoder support
 - SSH via Hyper-V socket proxy (no network required)
 - Snapshots
-- Fixed 1080P60 display
+- Display resizes to the connection window; optional native display at your monitor's resolution and refresh rate (streamed with Sunshine/Moonlight)
 - Host to client hot-key support
 - Provision and boot with / without internet
 - Supports running Claude Cowork and Docker inside the VM thanks to Nested Virtualization Support
