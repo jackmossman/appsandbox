@@ -3,6 +3,19 @@
 
 # App Sandbox
 
+> **This is a fork** of [jamesstringer90/appsandbox](https://github.com/jamesstringer90/appsandbox),
+> which is the official project. The `fullscreen-native` branch adds, for Windows guests on a
+> Windows host:
+> - **Native display**: the guest runs at your monitor's own resolution and refresh rate,
+>   streamed with Sunshine and Moonlight (see *Native display* under
+>   [About App Sandbox](#about-app-sandbox)).
+> - **Resize to window**: the connection window resizes the guest's screen to fit it.
+>
+> The fork follows upstream and publishes no releases of its own. Build it from source;
+> without the maintainer's signing keys that gives a test-signed dev build (see
+> [tools/sign/SIGNING.md](tools/sign/SIGNING.md)). The Releases links below point to the
+> official signed builds, which don't include these changes.
+
 App Sandbox is a virtual machine app for Windows and macOS that's focused on performance and ease of use.
 
 Windows features:
